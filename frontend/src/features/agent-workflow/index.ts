@@ -1,0 +1,22 @@
+/**
+ * agent-workflow feature — public API
+ *
+ * Sprint 10 Phase 2 — Developer B
+ */
+export { AgentWorkflowTrigger } from './components/AgentWorkflowTrigger';
+export type { AgentWorkflowTriggerProps } from './components/AgentWorkflowTrigger';
+
+export { AgentProgressPipeline } from './components/AgentProgressPipeline';
+export type { AgentProgressPipelineProps } from './components/AgentProgressPipeline';
+
+export { AgentStatusMonitor } from './components/AgentStatusMonitor';
+export type { AgentStatusMonitorProps } from './components/AgentStatusMonitor';
+
+export { StopAgentButton } from './components/StopAgentButton';
+export type { StopAgentButtonProps } from './components/StopAgentButton';
+
+export { WorkflowResults } from './components/WorkflowResults';
+export type { WorkflowResultsProps } from './components/WorkflowResults';
+
+export { useWorkflowProgress } from './hooks/useWorkflowProgress';
+export type { WorkflowProgressState } from './hooks/useWorkflowProgress';

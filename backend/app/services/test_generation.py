@@ -1,0 +1,742 @@
+"""Test generation service using Universal LLM (supports Google, Cerebras, OpenRouter)."""
+from typing import List, Dict, Optional
+from sqlalchemy.orm import Session
+
+from app.services.universal_llm import UniversalLLMService
+from app.services.kb_context import KBContextService
+
+
+class TestGenerationService:
+    """Service for generating test cases using LLM."""
+
+    # Minimum token budget for generation requests.  User settings often have
+    # small values (e.g. 1200) that fit simple completions but cause mid-JSON
+    # truncation for multi-test-case responses.  We never honour a value below
+    # this floor for *generation* calls.
+    MIN_GENERATION_TOKENS: int = 4096
+
+    def __init__(self):
+        self.llm = UniversalLLMService()
+        self.kb_context = KBContextService()
+
+    # ------------------------------------------------------------------
+    # Token helpers
+    # ------------------------------------------------------------------
+
+    def _effective_max_tokens(self, requested: int) -> int:
+        """Return max(requested, MIN_GENERATION_TOKENS).
+
+        Prevents user-saved values like 1200 from causing mid-JSON truncation
+        when generating multiple detailed test cases.
+        """
+        return max(requested, self.MIN_GENERATION_TOKENS)
+
+    # ------------------------------------------------------------------
+    # JSON recovery
+    # ------------------------------------------------------------------
+
+    def _try_recover_truncated_json(self, content: str) -> Optional[str]:
+        """Attempt to recover usable test cases from a truncated JSON response.
+
+        Strategy: extract every complete object inside the ``test_cases`` array
+        using a simple brace-counting scan, then re-assemble them into valid
+        JSON.  Returns *None* when nothing usable is found.
+
+        Args:
+            content: Raw LLM response text (may be truncated).
+
+        Returns:
+            A valid JSON string ``{"test_cases": [...]}`` containing only the
+            complete cases, or *None* if the content is not even partially
+            parseable.
+        """
+        import json
+        import re
+
+        # Fast path: already valid JSON
+        try:
+            parsed = json.loads(content)
+            return json.dumps(parsed)
+        except json.JSONDecodeError:
+            pass
+
+        # Find the start of the test_cases array
+        start_marker = '"test_cases"'
+        marker_idx = content.find(start_marker)
+        if marker_idx == -1:
+            return None
+
+        array_start = content.find('[', marker_idx)
+        if array_start == -1:
+            return None
+
+        # Walk through the array collecting complete {} objects
+        complete_cases: list = []
+        pos = array_start + 1
+        length = len(content)
+
+        while pos < length:
+            # Skip whitespace and commas between objects
+            while pos < length and content[pos] in ' \t\n\r,':
+                pos += 1
+
+            if pos >= length or content[pos] != '{':
+                break
+
+            # Count braces to find where this object ends
+            depth = 0
+            obj_start = pos
+            in_string = False
+            escape_next = False
+
+            while pos < length:
+                ch = content[pos]
+                if escape_next:
+                    escape_next = False
+                elif ch == '\\':
+                    escape_next = True
+                elif ch == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            # Found end of this object
+                            obj_text = content[obj_start: pos + 1]
+                            try:
+                                obj = json.loads(obj_text)
+                                complete_cases.append(obj)
+                            except json.JSONDecodeError:
+                                pass  # Malformed object — skip
+                            pos += 1
+                            break
+                pos += 1
+            else:
+                # Reached end of string without closing brace → object is truncated
+                break
+
+        if not complete_cases:
+            # Return empty-but-valid JSON so callers can decide what to do
+            return json.dumps({"test_cases": []})
+
+        return json.dumps({"test_cases": complete_cases})
+        
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt for test generation."""
+        return """You are an expert test case generator for web applications.
+
+Your task is to generate comprehensive, well-structured test cases based on user requirements.
+
+**IMPORTANT: When Knowledge Base (KB) context is provided:**
+- Reference specific KB documents in test steps
+- Use exact field names and UI paths from KB system guides  
+- Include realistic test data from KB product catalogs
+- Cite KB sources in test steps using format: "(per [Document Name])" or "(ref: [Document Name])"
+- Validate test assertions against documented procedures in KB
+- Prioritize information from KB documents over general knowledge
+
+OUTPUT FORMAT:
+Generate test cases in the following JSON format:
+{
+  "test_cases": [
+    {
+      "title": "Test case title",
+      "description": "What this test verifies",
+      "test_type": "e2e|unit|integration|api",
+      "priority": "high|medium|low",
+      "steps": [
+        "Step 1: Action to take",
+        "Step 2: Next action (per KB_Document.pdf)",
+        "Step 3: Final action"
+      ],
+      "expected_result": "What should happen",
+      "preconditions": "Any setup required (optional)",
+      "test_data": {
+        "key": "value"
+      }
+    }
+  ]
+}
+
+GUIDELINES:
+- Be specific and actionable with detailed step-by-step instructions
+- Include ALL necessary steps - do NOT skip or abbreviate steps
+- Each step should be a single, clear action (e.g., "Click the 'Login' button" not "Login to system")
+- Include realistic test data with specific values
+- Cover both positive and negative scenarios
+- Prioritize critical functionality as "high"
+- Use clear, concise language
+- Each test should be independent and repeatable
+- Include edge cases when relevant
+- When KB context is available, cite the source document for domain-specific steps
+- For complex workflows, break down into 15-20 granular steps if needed
+- NEVER truncate or summarize steps - always provide complete sequences
+
+**FILE UPLOAD SUPPORT:**
+For test cases involving file uploads, you MUST generate detailed step objects with:
+- action: "upload_file"
+- selector: "input[type='file']" (or specific file input selector)
+- file_path: One of the predefined test files
+- instruction: Clear description of what to upload
+
+**Available test files:**
+- /app/test_files/hkid_sample.pdf (HKID document)
+- /app/test_files/passport_sample.jpg (Passport photo)
+- /app/test_files/address_proof.pdf (Address proof document)
+
+**IMPORTANT:** File upload steps MUST include the detailed_steps with structured data.
+
+Example:
+```json
+{
+  "steps": ["Upload HKID document"],
+  "test_data": {
+    "detailed_steps": [{
+      "action": "upload_file",
+      "selector": "input[type='file']",
+      "file_path": "/app/test_files/hkid_sample.pdf",
+      "instruction": "Upload HKID document"
+    }]
+  }
+}
+```
+
+**TEST DATA GENERATION SUPPORT:**
+For test cases requiring valid test data (HKID numbers, phone numbers, emails), use dynamic generation placeholders that will be automatically replaced during execution with properly formatted, valid data.
+
+**Available data generators:**
+
+1. **HKID (Hong Kong Identity Card) - Composite Data with Part Extraction**
+   - Pattern: {generate:hkid} → Full HKID with check digit (e.g., A123456(3))
+   - Pattern: {generate:hkid:main} → Main part only: letter + 6 digits (e.g., A123456)
+   - Pattern: {generate:hkid:check} → Check digit only (e.g., 3)
+   - Pattern: {generate:hkid:letter} → Letter part only (e.g., A)
+   - Pattern: {generate:hkid:digits} → 6 digits only (e.g., 123456)
+   - Pattern: {generate:hkid:full} → Same as {generate:hkid}
+   
+   **IMPORTANT - Split Field Scenario:** Many forms have separate fields for HKID main part and check digit.
+   - Use {generate:hkid:main} for the main HKID field
+   - Use {generate:hkid:check} for the check digit field
+   - System guarantees consistency: check digit ALWAYS matches the main part (same generated HKID)
+   - All parts extracted from the same cached HKID within a test
+
+2. **Hong Kong Phone Number**
+   - Pattern: {generate:phone}
+   - Generates: 8-digit HK phone number starting with 5-9 (e.g., 91234567)
+
+3. **Email Address**
+   - Pattern: {generate:email}
+   - Generates: Unique email with timestamp (e.g., testuser1234567890@example.com)
+   - Prevents account creation conflicts
+
+**Usage in test_data:**
+Use these patterns in the "value" field of detailed_steps or directly in test_data fields.
+
+**Example 1: Single HKID field (full format)**
+```json
+{
+  "steps": ["Enter HKID number"],
+  "test_data": {
+    "detailed_steps": [{
+      "action": "input",
+      "selector": "input[name='hkid']",
+      "value": "{generate:hkid}",
+      "instruction": "Enter HKID number A123456(3)"
+    }]
+  }
+}
+```
+
+**Example 2: Split HKID fields (main + check digit) ⭐ RECOMMENDED FOR SPLIT FORMS**
+```json
+{
+  "steps": [
+    "Enter HKID main part (letter + 6 digits)",
+    "Enter HKID check digit"
+  ],
+  "test_data": {
+    "detailed_steps": [
+      {
+        "action": "input",
+        "selector": "input[name='hkid_main']",
+        "value": "{generate:hkid:main}",
+        "instruction": "Enter main HKID part A123456"
+      },
+      {
+        "action": "input",
+        "selector": "input[name='hkid_check']",
+        "value": "{generate:hkid:check}",
+        "instruction": "Enter HKID check digit 3"
+      }
+    ]
+  }
+}
+```
+**Note:** Check digit will ALWAYS match the main part (both extracted from same generated HKID).
+
+**Example 3: Complete registration form with multiple generated fields**
+```json
+{
+  "steps": [
+    "Enter HKID main part",
+    "Enter HKID check digit",
+    "Enter phone number",
+    "Enter email address"
+  ],
+  "test_data": {
+    "detailed_steps": [
+      {
+        "action": "input",
+        "selector": "input[name='hkid_main']",
+        "value": "{generate:hkid:main}",
+        "instruction": "Enter HKID main part"
+      },
+      {
+        "action": "input",
+        "selector": "input[name='hkid_check']",
+        "value": "{generate:hkid:check}",
+        "instruction": "Enter HKID check digit"
+      },
+      {
+        "action": "input",
+        "selector": "input[name='phone']",
+        "value": "{generate:phone}",
+        "instruction": "Enter phone number"
+      },
+      {
+        "action": "input",
+        "selector": "input[name='email']",
+        "value": "{generate:email}",
+        "instruction": "Enter email address"
+      }
+    ]
+  }
+}
+```
+
+**When to use test data generators:**
+- HKID/passport number fields (especially split fields)
+- Phone number inputs requiring HK format
+- Email addresses for account registration
+- Any field requiring unique, valid data
+- Forms with validation that checks data format
+
+**Benefits:**
+- ✅ Always valid data (HKID check digits calculated correctly)
+- ✅ Split field consistency (check digit matches main part)
+- ✅ No hardcoded values (prevents conflicts)
+- ✅ Unique data per execution (email uniqueness)
+- ✅ No manual data preparation required
+
+**LOOP SUPPORT FOR REPEATED STEP SEQUENCES:**
+When a test requires repeating the same sequence of steps multiple times (e.g., upload 5 documents, fill 3 forms, add N items), use loop_blocks instead of duplicating steps.
+
+**Loop block structure:**
+```json
+{
+  "steps": [
+    "Navigate to upload page",
+    "Click upload button",
+    "Select file from dialog",
+    "Click confirm button",
+    "Verify success message"
+  ],
+  "test_data": {
+    "detailed_steps": [/* step details */],
+    "loop_blocks": [
+      {
+        "id": "file_upload_loop",
+        "start_step": 2,
+        "end_step": 4,
+        "iterations": 5,
+        "description": "Upload 5 HKID documents",
+        "variables": {
+          "file_path": "/app/test_files/document_{iteration}.pdf"
+        }
+      }
+    ]
+  }
+}
+```
+
+**Loop block fields:**
+- id: Unique identifier for the loop
+- start_step: First step in loop (1-based index)
+- end_step: Last step in loop (inclusive)
+- iterations: Number of times to repeat
+- description: Human-readable description
+- variables: Optional variable substitution using {iteration} placeholder
+
+**When to use loops:**
+- Uploading multiple files (5+ files)
+- Filling multiple identical forms
+- Adding multiple items to cart/list
+- Repeating any sequence 3+ times
+
+**Benefits:**
+- Cleaner test cases (3 steps instead of 15)
+- Easier to maintain (update once, applies to all iterations)
+- Variable substitution for dynamic values
+
+IMPORTANT: Return ONLY valid JSON, no additional text or explanation. Do NOT abbreviate or skip steps to save tokens - completeness is critical."""
+
+    def _build_user_prompt(
+        self,
+        requirement: str,
+        test_type: Optional[str] = None,
+        num_tests: int = 3,
+        kb_context: str = ""
+    ) -> str:
+        """
+        Build the user prompt for test generation.
+        
+        Args:
+            requirement: The feature or requirement to test
+            test_type: Type of tests to generate (e2e, unit, integration, api)
+            num_tests: Number of test cases to generate
+            kb_context: Knowledge Base context (formatted string from KBContextService)
+        """
+        prompt = f"Generate {num_tests} test case(s) for the following requirement:\n\n{requirement}"
+        
+        if test_type:
+            prompt += f"\n\nTest Type: {test_type}"
+        
+        # Add KB context if provided
+        if kb_context:
+            prompt += f"\n\n{kb_context}"
+            prompt += "\n\n**IMPORTANT: Use the Knowledge Base documents above to:**"
+            prompt += "\n- Include exact UI paths, field names, and system terminology"
+            prompt += "\n- Use realistic test data from the documented examples"
+            prompt += "\n- Cite KB sources when referencing documented procedures"
+            prompt += "\n- Ensure test steps match documented workflows"
+        
+        prompt += "\n\n**Generation Instructions:**"
+        prompt += "\n- Generate comprehensive test cases with COMPLETE step sequences (do not abbreviate)"
+        prompt += "\n- Include ALL necessary steps for each test case (15-20 steps for complex workflows)"
+        prompt += "\n- Cover positive scenarios, negative scenarios, and edge cases where applicable"
+        prompt += "\n- Use specific, actionable language for each step"
+        prompt += "\n- Include realistic test data with actual values (not placeholders)"
+        prompt += "\n\nIf the requirement is vague, make reasonable assumptions and document them in the test case description."
+        
+        return prompt
+    
+    async def generate_tests(
+        self,
+        requirement: str,
+        test_type: Optional[str] = None,
+        num_tests: int = 3,
+        model: Optional[str] = None,
+        category_id: Optional[int] = None,
+        db: Optional[Session] = None,
+        use_kb_context: bool = True,
+        max_kb_docs: int = 10,
+        user_id: Optional[int] = None,
+        reqiq_project_id: Optional[str] = None,
+    ) -> Dict:
+        """
+        Generate test cases based on a requirement.
+        
+        Args:
+            requirement: The feature or requirement to test
+            test_type: Type of tests (e2e, unit, integration, api)
+            num_tests: Number of test cases to generate (default: 3)
+            model: Optional model override
+            category_id: Optional KB category ID for context
+            db: Optional database session for KB context retrieval
+            use_kb_context: Whether to use KB context if available
+            max_kb_docs: Maximum number of KB documents to include
+            user_id: Optional user ID to load generation settings from
+            
+        Returns:
+            Dict with generated test cases and metadata
+            
+        Raises:
+            Exception: If generation fails
+        """
+        # Log the request parameters for debugging
+        print(f"[DEBUG] 📝 Generation request: requirement='{requirement[:50]}...', num_tests={num_tests}, use_kb_context={use_kb_context}, category_id={category_id}")
+        
+        # Load user's generation settings if user_id provided
+        user_config = None
+        if db and user_id:
+            try:
+                from app.services.user_settings_service import user_settings_service
+                user_config = user_settings_service.get_provider_config(
+                    db=db,
+                    user_id=user_id,
+                    config_type="generation"
+                )
+                if user_config:
+                    print(f"[DEBUG] 🎯 Loaded user generation config: provider={user_config.get('provider')}, model={user_config.get('model')}")
+            except Exception as e:
+                print(f"[DEBUG] ⚠️ Could not load user generation settings: {str(e)}")
+                user_config = None
+        
+        # Retrieve KB context if requested
+        kb_context = ""
+        kb_docs_used = 0
+
+        # Phase 3: Try ReqIQ first; fall back to SQLite KB
+        if reqiq_project_id and use_kb_context:
+            try:
+                reqiq_context = await self.kb_context.get_reqiq_context(
+                    project_id=reqiq_project_id,
+                    query=requirement[:500],
+                )
+                if reqiq_context:
+                    kb_context = f"=== Requirements Context (ReqIQ) ===\n\n{reqiq_context}\n"
+                    kb_docs_used = 1
+                    print(f"[DEBUG] ReqIQ context loaded ({len(reqiq_context)} chars)")
+            except Exception as e:
+                print(f"[DEBUG] ReqIQ context skipped: {e}")
+
+        if not kb_context and db and use_kb_context:
+            try:
+                kb_context = await self.kb_context.get_category_context(
+                    db=db,
+                    category_id=category_id,  # None = all categories
+                    max_docs=max_kb_docs
+                )
+                if kb_context:
+                    # Count documents in context
+                    kb_docs_used = kb_context.count("[Document ")
+            except Exception as e:
+                # Log error but continue without KB context
+                print(f"Warning: Could not retrieve KB context: {str(e)}")
+                kb_context = ""
+        
+        # Build messages
+        messages = [
+            {"role": "system", "content": self._build_system_prompt()},
+            {"role": "user", "content": self._build_user_prompt(requirement, test_type, num_tests, kb_context)}
+        ]
+        
+        # Determine provider/model/temperature/max_tokens from user config or defaults
+        if user_config:
+            # Use user's generation settings
+            provider = user_config.get("provider", "openrouter")
+            generation_model = user_config.get("model") if not model else model  # Explicit model param takes precedence
+            
+            # Strip provider prefix from model ONLY for non-OpenRouter providers
+            # - Cerebras/Google: "cerebras/llama3.3-70b" -> "llama3.3-70b"
+            # - OpenRouter: Keep "meta-llama/llama-3.3-70b-instruct:free" as-is (needs org/model format)
+            if generation_model and provider.lower() != "openrouter":
+                # Only strip if it starts with the provider name
+                provider_prefix = f"{provider.lower()}/"
+                if generation_model.lower().startswith(provider_prefix):
+                    generation_model = generation_model.split("/", 1)[1]
+            
+            temperature = user_config.get("temperature", 0.7)
+            raw_max_tokens = user_config.get("max_tokens", 4096)
+            max_tokens_val = self._effective_max_tokens(raw_max_tokens)
+            print(f"[DEBUG] 🎯 Using user's generation config: {provider}/{generation_model} (temp={temperature}, max_tokens={max_tokens_val})")
+        else:
+            # Fall back to .env defaults
+            provider = "openrouter"
+            generation_model = model  # Use explicit model param or None (will use settings default)
+            temperature = 0.7
+            max_tokens_val = self._effective_max_tokens(4096)
+            print(f"[DEBUG] 📋 Using .env defaults: {provider} (temp={temperature}, max_tokens={max_tokens_val})")
+        
+        # Call Universal LLM service (supports Google, Cerebras, OpenRouter)
+        try:
+            response = await self.llm.chat_completion(
+                messages=messages,
+                provider=provider,
+                model=generation_model,
+                temperature=temperature,
+                max_tokens=max_tokens_val
+            )
+            
+            # Extract content
+            if "choices" not in response or len(response["choices"]) == 0:
+                raise Exception("No response from LLM")
+            
+            content = response["choices"][0]["message"]["content"]
+            
+            # Parse JSON response
+            import json
+            
+            # Try to extract JSON from markdown code blocks if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            # Parse JSON
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError as e:
+                # Attempt to salvage complete test cases from a truncated response
+                # (common when max_tokens is too low for the full JSON output)
+                recovered = self._try_recover_truncated_json(content)
+                if recovered is not None:
+                    try:
+                        result = json.loads(recovered)
+                        if result.get("test_cases"):  # at least one complete case
+                            print(
+                                f"[WARN] LLM response was truncated; recovered "
+                                f"{len(result['test_cases'])} complete test case(s). "
+                                f"Increase max_tokens to avoid this."
+                            )
+                            result["_truncation_recovered"] = True
+                        else:
+                            raise Exception(
+                                f"Failed to parse LLM response as JSON: {str(e)}"
+                                f"\n\nRaw response:\n{content[:500]}"
+                            )
+                    except json.JSONDecodeError:
+                        raise Exception(
+                            f"Failed to parse LLM response as JSON: {str(e)}"
+                            f"\n\nRaw response:\n{content[:500]}"
+                        )
+                else:
+                    raise Exception(
+                        f"Failed to parse LLM response as JSON: {str(e)}"
+                        f"\n\nRaw response:\n{content[:500]}"
+                    )
+            
+            # Validate structure
+            if "test_cases" not in result:
+                raise Exception("Response missing 'test_cases' field")
+
+            # Move internal flag into metadata before adding the full metadata block
+            truncation_recovered = result.pop("_truncation_recovered", False)
+
+            # Add metadata
+            result["metadata"] = {
+                "requirement": requirement,
+                "test_type": test_type,
+                "num_requested": num_tests,
+                "num_generated": len(result.get("test_cases", [])),
+                "model": response.get("model", "unknown"),
+                "tokens": response.get("usage", {}).get("total_tokens", 0),
+                "kb_context_used": bool(kb_context),
+                "kb_category_id": category_id,
+                "kb_documents_used": kb_docs_used,
+                "truncation_recovered": truncation_recovered,
+            }
+            
+            return result
+            
+        except Exception as e:
+            # Log detailed error for debugging
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"[ERROR] Test generation failed: {str(e)}")
+            print(f"[ERROR] Full traceback:\n{error_details}")
+            raise Exception(f"Test generation failed: {str(e)}")
+
+    
+    async def generate_tests_for_page(
+        self,
+        page_name: str,
+        page_description: str,
+        num_tests: int = 5,
+        model: Optional[str] = None,
+        category_id: Optional[int] = None,
+        db: Optional[Session] = None,
+        use_kb_context: bool = True,
+        max_kb_docs: int = 10,
+        user_id: Optional[int] = None
+    ) -> Dict:
+        """
+        Generate E2E test cases for a specific page.
+        
+        Args:
+            page_name: Name of the page (e.g., "Login Page")
+            page_description: Description of page functionality
+            num_tests: Number of test cases to generate
+            model: Optional model override
+            category_id: Optional KB category ID for context
+            db: Optional database session for KB context
+            use_kb_context: Whether to use KB context if available
+            max_kb_docs: Maximum number of KB documents to include
+            user_id: Optional user ID to load generation settings from
+            
+        Returns:
+            Dict with generated test cases
+        """
+        requirement = f"""
+Page: {page_name}
+
+Description:
+{page_description}
+
+Generate comprehensive E2E test cases for this page including:
+- Happy path scenarios
+- Validation errors
+- Edge cases
+- User interactions
+"""
+        
+        return await self.generate_tests(
+            requirement=requirement,
+            test_type="e2e",
+            num_tests=num_tests,
+            model=model,
+            category_id=category_id,
+            db=db,
+            use_kb_context=use_kb_context,
+            max_kb_docs=max_kb_docs,
+            user_id=user_id
+        )
+    
+    async def generate_api_tests(
+        self,
+        endpoint: str,
+        method: str,
+        description: str,
+        num_tests: int = 4,
+        model: Optional[str] = None,
+        category_id: Optional[int] = None,
+        db: Optional[Session] = None,
+        use_kb_context: bool = True,
+        max_kb_docs: int = 10,
+        user_id: Optional[int] = None
+    ) -> Dict:
+        """
+        Generate API test cases for an endpoint.
+        
+        Args:
+            endpoint: API endpoint path (e.g., "/api/v1/users")
+            method: HTTP method (GET, POST, PUT, DELETE)
+            description: What the endpoint does
+            num_tests: Number of test cases to generate
+            model: Optional model override
+            category_id: Optional KB category ID for context
+            db: Optional database session for KB context
+            use_kb_context: Whether to use KB context if available
+            max_kb_docs: Maximum number of KB documents to include
+            user_id: Optional user ID to load generation settings from
+            
+        Returns:
+            Dict with generated test cases
+        """
+        requirement = f"""
+API Endpoint: {method} {endpoint}
+
+Description:
+{description}
+
+Generate API test cases including:
+- Valid requests with expected responses
+- Invalid requests (bad data, missing fields)
+- Authentication/authorization scenarios
+- Edge cases (empty data, large payloads)
+"""
+        
+        return await self.generate_tests(
+            requirement=requirement,
+            test_type="api",
+            num_tests=num_tests,
+            model=model,
+            category_id=category_id,
+            db=db,
+            use_kb_context=use_kb_context,
+            max_kb_docs=max_kb_docs,
+            user_id=user_id
+        )
+

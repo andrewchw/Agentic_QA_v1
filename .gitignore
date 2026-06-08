@@ -1,0 +1,122 @@
+# Customer export output (sibling folder — never commit)
+../Agentic_QA_v1/
+
+# API Keys and Secrets
+.cursor/mcp.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build outputs
+dist/
+build/
+out/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Misc
+*.bak
+*.orig
+
+# Python
+__pycache__/
+*/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pyd
+.tox/
+
+# Backend specific
+backend/venv/
+backend/env/
+backend/.env
+
+# SQLite databases (each developer has their own local database)
+# Database files are NOT committed (binary files cause conflicts)
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# BUT we DO commit these database-related files:
+# ✅ migrations/*.py (schema changes - shared via Git)
+# ✅ db_seed.py (seed script - shared via Git)
+# ✅ seed_test_cases.json (seed data - shared via Git)
+# ✅ run_migrations.py (migration runner - shared via Git)
+
+# Test artifacts and screenshots
+backend/artifacts/
+backend/artifacts/screenshots/
+backend/artifacts/videos/
+backend/artifacts/debug_sessions/
+backend/screenshots/
+backend/videos/
+backend/user_data/
+test-results/
+playwright-report/
+
+# Video files (recordings from test runs)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.wmv
+
+# Test scripts (keep test suite, exclude temp test scripts)
+backend/check_*.py
+backend/test_queue_quick.py
+backend/verify_*.py
+backend/optimized_steps.py
+backend/update_test_steps.py
+
+# Python virtual environments
+**/venv/
+**/env/
+

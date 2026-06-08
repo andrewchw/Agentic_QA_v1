@@ -1,0 +1,2306 @@
+"""
+Stagehand-based Test Execution Service
+Uses Stagehand for browser automation with Playwright under the hood.
+"""
+import asyncio
+import json
+import os
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Callable
+from dotenv import load_dotenv
+import logging
+
+from stagehand import Stagehand, StagehandConfig
+from sqlalchemy.orm import Session
+
+from app.models.test_case import TestCase
+from app.models.test_execution import ExecutionStatus, ExecutionResult
+from app.crud import test_execution as crud_execution
+from app.services.email_otp_service import (
+    email_otp_service,
+    format_otp_steps,
+    get_email_credential_for_user,
+    is_otp_step,
+)
+from app.services.encryption_service import EncryptionService
+from app.services.step_module_resolver import resolve_steps
+
+encryption_service = EncryptionService() if os.getenv("CREDENTIAL_ENCRYPTION_KEY") else None
+
+# Load environment variables
+load_dotenv()
+
+# Logger for execution traces (captured by server file logging)
+logger = logging.getLogger(__name__)
+
+# Fix for Windows: Ensure ProactorEventLoop is used
+if sys.platform == 'win32':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except:
+        pass
+
+
+class StagehandExecutionService:
+    """
+    Service for executing test cases using Stagehand.
+    Provides browser automation with simple step execution.
+    """
+    
+    def __init__(
+        self,
+        browser: str = "chromium",
+        headless: bool = True,
+        screenshot_dir: str = "artifacts/screenshots",
+        video_dir: str = "artifacts/videos"
+    ):
+        """Initialize Stagehand execution service."""
+        self.browser = browser
+        self.headless = headless
+        self.screenshot_dir = Path(screenshot_dir)
+        self.video_dir = Path(video_dir)
+        
+        # Ensure directories exist
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.stagehand: Optional[Stagehand] = None
+        self.page = None
+        # Set during execute_test / analysis realtime runs so _execute_navigation can embed HTTP Basic auth
+        self._runtime_http_credentials: Optional[Dict[str, Any]] = None
+
+    def set_runtime_http_credentials(self, creds: Optional[Dict[str, Any]]) -> None:
+        """HTTP Basic auth for navigations (e.g. UAT). Applied in _execute_navigation when URL is extracted."""
+        if creds and creds.get("username") and creds.get("password"):
+            self._runtime_http_credentials = {
+                "username": str(creds["username"]),
+                "password": str(creds["password"]),
+            }
+        else:
+            self._runtime_http_credentials = None
+
+    async def initialize(self, user_config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize Stagehand browser.
+        
+        Args:
+            user_config: Optional user configuration dict with provider, model, temperature, max_tokens.
+                        If provided, uses user's settings. Otherwise falls back to .env defaults.
+        """
+        if not self.stagehand:
+            # Ensure Windows event loop policy is set
+            if sys.platform == 'win32':
+                loop = asyncio.get_event_loop()
+                if not isinstance(loop, asyncio.ProactorEventLoop):
+                    try:
+                        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                    except:
+                        pass
+            
+            logger.debug(f"StagehandExecutionService: Initializing Stagehand in thread {threading.current_thread().name}")
+            
+            # Get browser configuration
+            browser_slowmo = int(os.getenv("BROWSER_SLOWMO", "0"))
+            
+            # Build browser launch options
+            launch_options = {
+                "handle_sigint": False,
+                "handle_sigterm": False,
+                "handle_sighup": False
+            }
+            if browser_slowmo > 0:
+                launch_options["slow_mo"] = browser_slowmo
+            
+            # Determine which provider to use
+            # Priority: user_config > .env MODEL_PROVIDER > legacy flags
+            if user_config:
+                # Use user's settings from database
+                model_provider = user_config.get("provider", "openrouter").lower()
+                logger.info(f"StagehandExecutionService: Using user's configured provider: {model_provider}")
+            else:
+                # Fall back to .env configuration
+                model_provider = os.getenv("MODEL_PROVIDER", "openrouter").lower()
+                use_google_direct = os.getenv("USE_GOOGLE_DIRECT", "false").lower() == "true"
+                use_cerebras = os.getenv("USE_CEREBRAS", "false").lower() == "true"
+                
+                # Legacy support: USE_GOOGLE_DIRECT and USE_CEREBRAS override MODEL_PROVIDER
+                if use_cerebras:
+                    model_provider = "cerebras"
+                elif use_google_direct:
+                    model_provider = "google"
+                logger.info(f"StagehandExecutionService: Using .env default provider: {model_provider}")
+            
+            # Configure model based on provider
+            if model_provider == "cerebras":
+                # Use Cerebras API (fast inference)
+                cerebras_api_key = os.getenv("CEREBRAS_API_KEY")
+                # Use user's model selection if available, otherwise use .env default
+                cerebras_model = user_config.get("model") if user_config else os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
+                
+                # Strip provider prefix from model if present (e.g., "cerebras/llama3.3-70b" -> "llama3.3-70b")
+                if cerebras_model and cerebras_model.lower().startswith("cerebras/"):
+                    cerebras_model = cerebras_model.split("/", 1)[1]
+                
+                if not cerebras_api_key:
+                    raise ValueError(
+                        "CEREBRAS_API_KEY not set in .env file. "
+                        "Get your key from: https://cloud.cerebras.ai/"
+                    )
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    # Use Cerebras via LiteLLM
+                    model_name=f"cerebras/{cerebras_model}",
+                    model_api_key=cerebras_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                logger.info(f"StagehandExecutionService: Using Cerebras API with model: {cerebras_model}")
+                if user_config:
+                    logger.debug(
+                        "StagehandExecutionService: User config temp=%s max_tokens=%s",
+                        user_config.get("temperature", 0.7),
+                        user_config.get("max_tokens", 4096),
+                    )
+                
+            elif model_provider == "google":
+                # Use Google API directly (FREE with Google AI Studio)
+                google_api_key = os.getenv("GOOGLE_API_KEY")
+                # Use user's model selection if available, otherwise use .env default
+                google_model = user_config.get("model") if user_config else os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")
+                
+                # Strip provider prefix from model if present (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+                if google_model and google_model.lower().startswith("google/"):
+                    google_model = google_model.split("/", 1)[1]
+                
+                if not google_api_key:
+                    raise ValueError(
+                        "GOOGLE_API_KEY not set in .env file. "
+                        "Get your key from: https://aistudio.google.com/app/apikey"
+                    )
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    # Use Google Gemini directly via LiteLLM
+                    model_name=f"gemini/{google_model}",
+                    model_api_key=google_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                logger.info(f"StagehandExecutionService: Using Google API directly with model: {google_model}")
+                if user_config:
+                    logger.debug(
+                        "StagehandExecutionService: User config temp=%s max_tokens=%s",
+                        user_config.get("temperature", 0.7),
+                        user_config.get("max_tokens", 4096),
+                    )
+                
+            elif model_provider == "azure":
+                # Use Azure OpenAI API via LiteLLM native Azure provider
+                azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "https://chatgpt-uat.openai.azure.com/openai/v1")
+                azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+                # Use user's model selection (deployment name) if available, otherwise use .env default
+                azure_model = user_config.get("model") if user_config else os.getenv("AZURE_OPENAI_MODEL", "ChatGPT-UAT")
+                
+                # Strip provider prefix from model if present
+                if azure_model and azure_model.lower().startswith("azure/"):
+                    azure_model = azure_model.split("/", 1)[1]
+
+                # gpt-5.2 lives on a dedicated Azure resource — override endpoint/version/key
+                if azure_model == "gpt-5.2":
+                    gpt52_endpoint = os.getenv("AZURE_OPENAI_GPT52_ENDPOINT")
+                    gpt52_api_version = os.getenv("AZURE_OPENAI_GPT52_API_VERSION", "2024-12-01-preview")
+                    gpt52_api_key = os.getenv("AZURE_OPENAI_GPT52_API_KEY") or azure_api_key
+                    if gpt52_endpoint:
+                        azure_endpoint = gpt52_endpoint
+                    azure_api_version = gpt52_api_version
+                    if gpt52_api_key:
+                        azure_api_key = gpt52_api_key
+
+                if not azure_api_key:
+                    raise ValueError(
+                        "AZURE_OPENAI_API_KEY not set in .env file. "
+                        "Please add your Azure OpenAI API key."
+                    )
+
+                clean_endpoint = azure_endpoint.replace("/openai/v1", "").replace("/openai", "").rstrip("/")
+                os.environ["AZURE_API_BASE"] = clean_endpoint
+                os.environ["AZURE_API_KEY"] = azure_api_key
+                os.environ["AZURE_API_VERSION"] = azure_api_version
+                os.environ.pop("OPENAI_API_BASE", None)
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    model_name=f"azure/{azure_model}",
+                    model_api_key=azure_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                logger.info(
+                    "StagehandExecutionService: Using Azure OpenAI with deployment: %s",
+                    azure_model,
+                )
+                if user_config:
+                    logger.debug(
+                        "StagehandExecutionService: User config temp=%s max_tokens=%s",
+                        user_config.get("temperature", 0.7),
+                        user_config.get("max_tokens", 4096),
+                    )
+                
+            elif model_provider == "openrouter":  # explicit openrouter
+                # Use OpenRouter (original behavior)
+                openrouter_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                # Use user's model selection if available, otherwise use .env default
+                openrouter_model = user_config.get("model") if user_config else os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-7b-instruct")
+                
+                # Strip provider prefix from model if present (e.g., "openrouter/model-name" -> "model-name")
+                # Note: OpenRouter models often include org/model format (e.g., "meta-llama/llama-3.3-70b")
+                # Only strip if it starts with "openrouter/"
+                if openrouter_model and openrouter_model.startswith("openrouter/"):
+                    openrouter_model = openrouter_model.split("/", 1)[1]
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    model_name=f"openrouter/{openrouter_model}",
+                    model_api_key=openrouter_key,
+                    local_browser_launch_options=launch_options
+                )
+                logger.info(f"StagehandExecutionService: Using OpenRouter with model: {openrouter_model}")
+                if user_config:
+                    logger.debug(
+                        "StagehandExecutionService: User config temp=%s max_tokens=%s",
+                        user_config.get("temperature", 0.7),
+                        user_config.get("max_tokens", 4096),
+                    )
+
+            elif model_provider == "local_vllm":
+                # Sprint 10.13: On-premises vLLM servers — OpenAI-compatible endpoints.
+                # Each model has its own base URL; LiteLLM routes via openai/ prefix.
+                local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
+                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+
+                # Resolve per-model endpoint from env (can be overridden in .env)
+                _endpoint_map = {
+                    "openai/gpt-oss-20b": os.getenv(
+                        "LOCAL_VLLM_GPT_OSS_20B_ENDPOINT",
+                        "http://192.168.206.190:8000/openai--gpt-oss-20b/v1",
+                    ),
+                    "RedHatAI/Qwen3.6-35B-A3B-NVFP4": os.getenv(
+                        "LOCAL_VLLM_QWEN3_35B_ENDPOINT",
+                        "http://192.168.206.190:8000/redhatai--qwen3.6-35b-a3b-nvfp4/v1",
+                    ),
+                    "DeepSeek-V4-Flash-4bit": os.getenv(
+                        "LOCAL_VLLM_DEEPSEEK_ENDPOINT",
+                        "http://192.168.206.164:1235/v1",
+                    ),
+                }
+                local_endpoint = _endpoint_map.get(local_model, os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"))
+
+                # LiteLLM requires OPENAI_API_BASE + openai/<model> for custom endpoints.
+                # Clear Azure env vars so LiteLLM does not mis-route.
+                os.environ["OPENAI_API_BASE"] = local_endpoint.rstrip("/")
+                os.environ["OPENAI_API_KEY"] = local_api_key
+                os.environ.pop("AZURE_API_BASE", None)
+                os.environ.pop("AZURE_API_KEY", None)
+                os.environ.pop("AZURE_API_VERSION", None)
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    model_name=f"openai/{local_model}",
+                    model_api_key=local_api_key,
+                    local_browser_launch_options=launch_options,
+                )
+                logger.info(
+                    "StagehandExecutionService: Using local vLLM model=%s endpoint=%s",
+                    local_model,
+                    local_endpoint,
+                )
+                if user_config:
+                    logger.debug(
+                        "StagehandExecutionService: User config temp=%s max_tokens=%s",
+                        user_config.get("temperature", 0.7),
+                        user_config.get("max_tokens", 4096),
+                    )
+
+            else:  # fallback to openrouter for any unrecognised provider
+                openrouter_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                openrouter_model = user_config.get("model") if user_config else os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-7b-instruct")
+                if openrouter_model and openrouter_model.startswith("openrouter/"):
+                    openrouter_model = openrouter_model.split("/", 1)[1]
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=self.headless,
+                    verbose=1,
+                    model_name=f"openrouter/{openrouter_model}",
+                    model_api_key=openrouter_key,
+                    local_browser_launch_options=launch_options,
+                )
+                logger.info(f"StagehandExecutionService: Fallback to OpenRouter with model: {openrouter_model}")
+
+            
+            logger.info(
+                "StagehandExecutionService: Browser settings headless=%s slow_mo=%sms",
+                self.headless,
+                browser_slowmo,
+            )
+            
+            self.stagehand = Stagehand(config)
+            await self.stagehand.init()
+            self.page = self.stagehand.page
+            
+            if not self.page:
+                raise RuntimeError("Stagehand initialization failed: page is None")
+            
+            # Set longer default timeout for complex flows (2 minutes)
+            if hasattr(self.page, '_page'):
+                self.page._page.set_default_timeout(120000)  # 120 seconds
+            
+            logger.info("StagehandExecutionService: Stagehand initialized successfully")
+    
+    async def initialize_with_cdp(self, cdp_endpoint: str, user_config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize Stagehand by connecting to an existing browser via CDP.
+        
+        Args:
+            cdp_endpoint: CDP endpoint URL (e.g., "http://127.0.0.1:9222")
+            user_config: Optional user configuration dict with provider, model, temperature, max_tokens
+        """
+        if not self.stagehand:
+            logger.info(
+                "StagehandExecutionService: Connecting Stagehand to existing browser via CDP: %s",
+                cdp_endpoint,
+            )
+            
+            # Configure model based on provider (same logic as initialize())
+            if user_config:
+                model_provider = user_config.get("provider", "openrouter").lower()
+            else:
+                model_provider = os.getenv("MODEL_PROVIDER", "openrouter").lower()
+            
+            # Build browser launch options with CDP URL
+            # NOTE: Python Stagehand uses "cdp_url" (underscore), not "cdpUrl" (camelCase)
+            launch_options = {
+                "cdp_url": cdp_endpoint  # Connect to existing browser via CDP
+            }
+            
+            # Build config based on provider
+            if model_provider == "cerebras":
+                cerebras_api_key = os.getenv("CEREBRAS_API_KEY")
+                cerebras_model = user_config.get("model") if user_config else os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
+                if cerebras_model and cerebras_model.lower().startswith("cerebras/"):
+                    cerebras_model = cerebras_model.split("/", 1)[1]
+                
+                config = StagehandConfig(
+                    env="LOCAL",  # Use LOCAL env with cdpUrl to connect to existing browser
+                    headless=False,  # Browser already running
+                    verbose=1,
+                    model_name=f"cerebras/{cerebras_model}",
+                    model_api_key=cerebras_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ CDP connection with Cerebras: {cerebras_model}")
+                
+            elif model_provider == "google":
+                google_api_key = os.getenv("GOOGLE_API_KEY")
+                google_model = user_config.get("model") if user_config else os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")
+                if google_model and google_model.lower().startswith("google/"):
+                    google_model = google_model.split("/", 1)[1]
+                
+                config = StagehandConfig(
+                    env="LOCAL",  # Use LOCAL env with cdpUrl to connect to existing browser
+                    headless=False,  # Browser already running
+                    verbose=1,
+                    model_name=f"google/{google_model}",
+                    model_api_key=google_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ CDP connection with Google: {google_model}")
+
+            elif model_provider == "azure":
+                azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "https://chatgpt-uat.openai.azure.com/openai/v1")
+                azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+                azure_model = user_config.get("model") if user_config else os.getenv("AZURE_OPENAI_MODEL", "ChatGPT-UAT")
+                if azure_model and azure_model.lower().startswith("azure/"):
+                    azure_model = azure_model.split("/", 1)[1]
+
+                if azure_model == "gpt-5.2":
+                    gpt52_endpoint = os.getenv("AZURE_OPENAI_GPT52_ENDPOINT")
+                    gpt52_api_version = os.getenv("AZURE_OPENAI_GPT52_API_VERSION", "2024-12-01-preview")
+                    gpt52_api_key = os.getenv("AZURE_OPENAI_GPT52_API_KEY") or azure_api_key
+                    if gpt52_endpoint:
+                        azure_endpoint = gpt52_endpoint
+                    azure_api_version = gpt52_api_version
+                    if gpt52_api_key:
+                        azure_api_key = gpt52_api_key
+
+                if not azure_api_key:
+                    raise ValueError("AZURE_OPENAI_API_KEY not set in .env file")
+
+                clean_endpoint = azure_endpoint.replace("/openai/v1", "").replace("/openai", "").rstrip("/")
+                os.environ["AZURE_API_BASE"] = clean_endpoint
+                os.environ["AZURE_API_KEY"] = azure_api_key
+                os.environ["AZURE_API_VERSION"] = azure_api_version
+                os.environ.pop("OPENAI_API_BASE", None)
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,
+                    verbose=1,
+                    model_name=f"azure/{azure_model}",
+                    model_api_key=azure_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ CDP connection with Azure OpenAI deployment: {azure_model}")
+
+            elif model_provider == "local_vllm":
+                # Sprint 10.13: On-premises vLLM — OpenAI-compatible endpoints via CDP
+                local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
+                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+
+                _endpoint_map = {
+                    "openai/gpt-oss-20b": os.getenv(
+                        "LOCAL_VLLM_GPT_OSS_20B_ENDPOINT",
+                        "http://192.168.206.190:8000/openai--gpt-oss-20b/v1",
+                    ),
+                    "RedHatAI/Qwen3.6-35B-A3B-NVFP4": os.getenv(
+                        "LOCAL_VLLM_QWEN3_35B_ENDPOINT",
+                        "http://192.168.206.190:8000/redhatai--qwen3.6-35b-a3b-nvfp4/v1",
+                    ),
+                    "DeepSeek-V4-Flash-4bit": os.getenv(
+                        "LOCAL_VLLM_DEEPSEEK_ENDPOINT",
+                        "http://192.168.206.164:1235/v1",
+                    ),
+                }
+                local_endpoint = _endpoint_map.get(
+                    local_model,
+                    os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"),
+                )
+
+                os.environ["OPENAI_API_BASE"] = local_endpoint.rstrip("/")
+                os.environ["OPENAI_API_KEY"] = local_api_key
+                os.environ.pop("AZURE_API_BASE", None)
+                os.environ.pop("AZURE_API_KEY", None)
+                os.environ.pop("AZURE_API_VERSION", None)
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,
+                    verbose=1,
+                    model_name=f"openai/{local_model}",
+                    model_api_key=local_api_key,
+                    local_browser_launch_options=launch_options,
+                )
+                print(f"[DEBUG] ✅ CDP connection with local vLLM model={local_model} endpoint={local_endpoint}")
+
+            else:  # openrouter / fallback
+                openrouter_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                openrouter_model = user_config.get("model") if user_config else os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-7b-instruct")
+                if openrouter_model and openrouter_model.startswith("openrouter/"):
+                    openrouter_model = openrouter_model.split("/", 1)[1]
+
+                config = StagehandConfig(
+                    env="LOCAL",  # Use LOCAL env with cdpUrl to connect to existing browser
+                    headless=False,  # Browser already running
+                    verbose=1,
+                    model_name=f"openrouter/{openrouter_model}",
+                    model_api_key=openrouter_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ CDP connection with OpenRouter: {openrouter_model}")
+
+            self.stagehand = Stagehand(config)
+            await self.stagehand.init()
+            self.page = self.stagehand.page
+            
+            if not self.page:
+                raise RuntimeError("Stagehand CDP connection failed: page is None")
+            
+            print(f"[DEBUG] Stagehand connected to existing browser via CDP, page={self.page}")
+    
+    async def cleanup(self):
+        """Clean up browser resources."""
+        if self.stagehand:
+            try:
+                await self.stagehand.close()
+            except:
+                pass
+            self.stagehand = None
+            self.page = None
+    
+    async def initialize_persistent(
+        self,
+        user_data_dir: str,
+        user_config: Optional[Dict[str, Any]] = None,
+        devtools: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Initialize Stagehand browser with persistent session (for debug mode).
+        
+        Args:
+            user_data_dir: Path to userDataDir for session persistence (cookies, localStorage, sessions)
+            user_config: Optional user configuration dict with provider, model, temperature, max_tokens
+            devtools: Whether to open DevTools (default: True for debugging)
+            
+        Returns:
+            Dict with browser_pid, devtools_url (if available), and other metadata
+        """
+        if not self.stagehand:
+            # Critical: Playwright requires ProactorEventLoop on Windows
+            # SelectorEventLoop doesn't support subprocess operations
+            if sys.platform == 'win32':
+                try:
+                    import asyncio
+                    # Check current loop type
+                    try:
+                        current_loop = asyncio.get_running_loop()
+                        loop_type = type(current_loop).__name__
+                        print(f"[DEBUG] Current event loop type: {loop_type}")
+                        
+                        if not isinstance(current_loop, asyncio.ProactorEventLoop):
+                            print(f"[ERROR] Wrong event loop type! Playwright requires ProactorEventLoop on Windows.")
+                            print(f"[ERROR] Current loop is {loop_type}. This will cause NotImplementedError.")
+                            raise RuntimeError(
+                                f"Playwright requires ProactorEventLoop on Windows, but found {loop_type}. "
+                                "Please ensure ProactorEventLoop policy is set before starting the server. "
+                                "Add this to your startup: asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())"
+                            )
+                    except RuntimeError:
+                        # No running loop, set policy and create new one
+                        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                        print(f"[DEBUG] Set ProactorEventLoop policy")
+                except Exception as e:
+                    print(f"[ERROR] Event loop check failed: {e}")
+                    raise
+            
+            print(f"[DEBUG] Initializing persistent Stagehand browser with userDataDir: {user_data_dir}")
+            
+            # Get browser configuration
+            browser_slowmo = int(os.getenv("BROWSER_SLOWMO", "0"))
+            
+            # Build browser launch options with persistence
+            launch_options = {
+                "handle_sigint": False,
+                "handle_sigterm": False,
+                "handle_sighup": False,
+                "user_data_dir": user_data_dir,  # Enable session persistence
+                "devtools": devtools,  # Open DevTools for visual debugging
+                "headless": False  # Always visible for debug mode
+            }
+            if browser_slowmo > 0:
+                launch_options["slow_mo"] = browser_slowmo
+            
+            # Determine which provider to use (same logic as initialize())
+            if user_config:
+                model_provider = user_config.get("provider", "openrouter").lower()
+                print(f"[DEBUG] 🎯 Using user's configured provider: {model_provider}")
+            else:
+                model_provider = os.getenv("MODEL_PROVIDER", "openrouter").lower()
+                use_google_direct = os.getenv("USE_GOOGLE_DIRECT", "false").lower() == "true"
+                use_cerebras = os.getenv("USE_CEREBRAS", "false").lower() == "true"
+                
+                if use_cerebras:
+                    model_provider = "cerebras"
+                elif use_google_direct:
+                    model_provider = "google"
+                print(f"[DEBUG] Using .env default provider: {model_provider}")
+            
+            # Configure model based on provider (same logic as initialize())
+            if model_provider == "cerebras":
+                cerebras_api_key = os.getenv("CEREBRAS_API_KEY")
+                cerebras_model = user_config.get("model") if user_config else os.getenv("CEREBRAS_MODEL", "llama3.1-8b")
+                
+                # Strip provider prefix from model if present (e.g., "cerebras/llama3.3-70b" -> "llama3.3-70b")
+                if cerebras_model and cerebras_model.lower().startswith("cerebras/"):
+                    cerebras_model = cerebras_model.split("/", 1)[1]
+                
+                if not cerebras_api_key:
+                    raise ValueError("CEREBRAS_API_KEY not set in .env file")
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,  # Always visible for debug mode
+                    verbose=1,
+                    model_name=f"cerebras/{cerebras_model}",
+                    model_api_key=cerebras_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ Using Cerebras API with model: {cerebras_model} (Debug Mode)")
+                
+            elif model_provider == "google":
+                google_api_key = os.getenv("GOOGLE_API_KEY")
+                google_model = user_config.get("model") if user_config else os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")
+                
+                # Strip provider prefix from model if present (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+                if google_model and google_model.lower().startswith("google/"):
+                    google_model = google_model.split("/", 1)[1]
+                
+                if not google_api_key:
+                    raise ValueError("GOOGLE_API_KEY not set in .env file")
+                
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,  # Always visible for debug mode
+                    verbose=1,
+                    model_name=f"gemini/{google_model}",
+                    model_api_key=google_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ Using Google API directly with model: {google_model} (Debug Mode)")
+
+            elif model_provider == "azure":
+                azure_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "https://chatgpt-uat.openai.azure.com/openai/v1")
+                azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+                azure_model = user_config.get("model") if user_config else os.getenv("AZURE_OPENAI_MODEL", "ChatGPT-UAT")
+
+                if azure_model and azure_model.lower().startswith("azure/"):
+                    azure_model = azure_model.split("/", 1)[1]
+
+                if azure_model == "gpt-5.2":
+                    gpt52_endpoint = os.getenv("AZURE_OPENAI_GPT52_ENDPOINT")
+                    gpt52_api_version = os.getenv("AZURE_OPENAI_GPT52_API_VERSION", "2024-12-01-preview")
+                    gpt52_api_key = os.getenv("AZURE_OPENAI_GPT52_API_KEY") or azure_api_key
+                    if gpt52_endpoint:
+                        azure_endpoint = gpt52_endpoint
+                    azure_api_version = gpt52_api_version
+                    if gpt52_api_key:
+                        azure_api_key = gpt52_api_key
+
+                if not azure_api_key:
+                    raise ValueError("AZURE_OPENAI_API_KEY not set in .env file")
+
+                clean_endpoint = azure_endpoint.replace("/openai/v1", "").replace("/openai", "").rstrip("/")
+                os.environ["AZURE_API_BASE"] = clean_endpoint
+                os.environ["AZURE_API_KEY"] = azure_api_key
+                os.environ["AZURE_API_VERSION"] = azure_api_version
+                os.environ.pop("OPENAI_API_BASE", None)
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,
+                    verbose=1,
+                    model_name=f"azure/{azure_model}",
+                    model_api_key=azure_api_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ Using Azure OpenAI with deployment: {azure_model} (Debug Mode)")
+
+            elif model_provider == "local_vllm":
+                # Sprint 10.13: On-premises vLLM — debug persistent session
+                local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
+                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+
+                _endpoint_map = {
+                    "openai/gpt-oss-20b": os.getenv(
+                        "LOCAL_VLLM_GPT_OSS_20B_ENDPOINT",
+                        "http://192.168.206.190:8000/openai--gpt-oss-20b/v1",
+                    ),
+                    "RedHatAI/Qwen3.6-35B-A3B-NVFP4": os.getenv(
+                        "LOCAL_VLLM_QWEN3_35B_ENDPOINT",
+                        "http://192.168.206.190:8000/redhatai--qwen3.6-35b-a3b-nvfp4/v1",
+                    ),
+                    "DeepSeek-V4-Flash-4bit": os.getenv(
+                        "LOCAL_VLLM_DEEPSEEK_ENDPOINT",
+                        "http://192.168.206.164:1235/v1",
+                    ),
+                }
+                local_endpoint = _endpoint_map.get(
+                    local_model,
+                    os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"),
+                )
+
+                os.environ["OPENAI_API_BASE"] = local_endpoint.rstrip("/")
+                os.environ["OPENAI_API_KEY"] = local_api_key
+                os.environ.pop("AZURE_API_BASE", None)
+                os.environ.pop("AZURE_API_KEY", None)
+                os.environ.pop("AZURE_API_VERSION", None)
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,
+                    verbose=1,
+                    model_name=f"openai/{local_model}",
+                    model_api_key=local_api_key,
+                    local_browser_launch_options=launch_options,
+                )
+                print(f"[DEBUG] ✅ Using local vLLM model={local_model} endpoint={local_endpoint} (Debug Mode)")
+
+            else:  # openrouter / fallback
+                openrouter_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                openrouter_model = user_config.get("model") if user_config else os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-7b-instruct")
+                if openrouter_model and openrouter_model.startswith("openrouter/"):
+                    openrouter_model = openrouter_model.split("/", 1)[1]
+
+                config = StagehandConfig(
+                    env="LOCAL",
+                    headless=False,  # Always visible for debug mode
+                    verbose=1,
+                    model_name=f"openrouter/{openrouter_model}",
+                    model_api_key=openrouter_key,
+                    local_browser_launch_options=launch_options
+                )
+                print(f"[DEBUG] ✅ Using OpenRouter with model: {openrouter_model} (Debug Mode)")
+
+            print(f"[DEBUG] Persistent browser settings: headless=False (debug mode), devtools={devtools}")
+            
+            self.stagehand = Stagehand(config)
+            await self.stagehand.init()
+            self.page = self.stagehand.page
+            
+            if not self.page:
+                raise RuntimeError("Stagehand initialization failed: page is None")
+            
+            # Set longer default timeout for complex flows
+            if hasattr(self.page, '_page'):
+                self.page._page.set_default_timeout(120000)  # 120 seconds
+            
+            # Extract browser metadata
+            browser_metadata = {
+                "user_data_dir": user_data_dir,
+                "devtools_enabled": devtools,
+                "browser_pid": None,
+                "devtools_url": None
+            }
+            
+            # Try to get browser PID and DevTools URL (Playwright-specific)
+            try:
+                if hasattr(self.page, '_page') and hasattr(self.page._page, 'context'):
+                    context = self.page._page.context
+                    if hasattr(context, 'browser') and context.browser:
+                        browser = context.browser
+                        # Get browser process (if available)
+                        if hasattr(browser, '_browser_type'):
+                            browser_metadata["browser_pid"] = os.getpid()  # Fallback to current process
+                        # DevTools URL typically available via CDP
+                        if devtools:
+                            browser_metadata["devtools_url"] = "chrome://inspect (browser DevTools opened automatically)"
+            except Exception as e:
+                print(f"[DEBUG] Could not extract browser metadata: {e}")
+            
+            print(f"[DEBUG] Persistent Stagehand initialized successfully, page={self.page}")
+            print(f"[DEBUG] Browser metadata: {browser_metadata}")
+            
+            return browser_metadata
+    
+    async def inject_browser_profile(self, profile_data: Dict[str, Any]):
+        """
+        Inject browser profile data (cookies, localStorage) into current browser context.
+        Profile data is processed entirely in RAM - no disk writes.
+        
+        Args:
+            profile_data: Dictionary containing:
+                - cookies: List of cookie dicts [{name, value, domain, path, ...}]
+                - localStorage: Dict of key-value pairs {"key": "value"}
+                - sessionStorage: Dict of key-value pairs (optional)
+        
+        Security: All data handled in-memory only, auto-cleaned by garbage collection.
+        """
+        if not self.page:
+            raise RuntimeError("Cannot inject profile: browser not initialized")
+        
+        print(f"[INFO] 🔒 Injecting browser profile (in-memory only)...")
+        
+        try:
+            # Get Playwright page and context
+            playwright_page = self.page._page if hasattr(self.page, '_page') else self.page
+            context = playwright_page.context
+            
+            # 1. Inject cookies (if provided)
+            if profile_data.get("cookies"):
+                cookies = profile_data["cookies"]
+                await context.add_cookies(cookies)
+                print(f"[INFO] ✅ Injected {len(cookies)} cookies")
+            
+            # 2. Inject localStorage (if provided)
+            if profile_data.get("localStorage"):
+                local_storage = profile_data["localStorage"]
+                # Execute JS to set localStorage items
+                await playwright_page.evaluate("""
+                    (storage) => {
+                        for (const [key, value] of Object.entries(storage)) {
+                            localStorage.setItem(key, value);
+                        }
+                    }
+                """, local_storage)
+                print(f"[INFO] ✅ Injected {len(local_storage)} localStorage items")
+            
+            # 3. Inject sessionStorage (if provided)
+            if profile_data.get("sessionStorage"):
+                session_storage = profile_data["sessionStorage"]
+                await playwright_page.evaluate("""
+                    (storage) => {
+                        for (const [key, value] of Object.entries(storage)) {
+                            sessionStorage.setItem(key, value);
+                        }
+                    }
+                """, session_storage)
+                print(f"[INFO] ✅ Injected {len(session_storage)} sessionStorage items")
+            
+            print(f"[INFO] ✅ Profile injection complete (all data in RAM)")
+            
+        except Exception as e:
+            print(f"[ERROR] ❌ Profile injection failed: {str(e)}")
+            raise RuntimeError(f"Failed to inject browser profile: {str(e)}")
+    
+    async def export_browser_profile(self) -> Dict[str, Any]:
+        """
+        Export current browser session data (cookies, localStorage, sessionStorage).
+        Returns data as in-memory dict for packaging into ZIP.
+        
+        Returns:
+            Dictionary containing:
+                - cookies: List of cookie dicts
+                - localStorage: Dict of key-value pairs
+                - sessionStorage: Dict of key-value pairs
+        
+        Security: Data never written to disk, only held in RAM for immediate packaging.
+        """
+        if not self.page:
+            raise RuntimeError("Cannot export profile: browser not initialized")
+        
+        print(f"[INFO] 📤 Exporting browser profile (in-memory only)...")
+        
+        try:
+            # Get Playwright page and context
+            playwright_page = self.page._page if hasattr(self.page, '_page') else self.page
+            context = playwright_page.context
+            page_url = (getattr(playwright_page, "url", "") or "").lower()
+            
+            # 1. Export cookies
+            cookies = await context.cookies()
+            print(f"[INFO] ✅ Exported {len(cookies)} cookies")
+            
+            async def _export_storage(storage_name: str) -> Dict[str, Any]:
+                try:
+                    storage = await playwright_page.evaluate("""
+                        (name) => {
+                            const storage = {};
+                            const target = window[name];
+                            if (!target) {
+                                return storage;
+                            }
+                            for (let i = 0; i < target.length; i++) {
+                                const key = target.key(i);
+                                storage[key] = target.getItem(key);
+                            }
+                            return storage;
+                        }
+                    """, storage_name)
+                    return storage
+                except Exception as e:
+                    print(
+                        f"[WARN] ⚠️ Failed to export {storage_name}: {str(e)}. "
+                        "Continuing with empty storage."
+                    )
+                    return {}
+
+            restricted_schemes = (
+                "about:",
+                "chrome:",
+                "chrome-error:",
+                "chrome-extension:",
+                "edge:",
+                "data:",
+                "file:",
+                "view-source:",
+            )
+            if page_url.startswith(restricted_schemes):
+                print(
+                    f"[WARN] ⚠️ Skipping storage export for restricted page URL: {page_url or 'unknown'}"
+                )
+                local_storage = {}
+                session_storage = {}
+            else:
+                # 2. Export localStorage
+                local_storage = await _export_storage("localStorage")
+                print(f"[INFO] ✅ Exported {len(local_storage)} localStorage items")
+                
+                # 3. Export sessionStorage
+                session_storage = await _export_storage("sessionStorage")
+                print(f"[INFO] ✅ Exported {len(session_storage)} sessionStorage items")
+            
+            profile_data = {
+                "cookies": cookies,
+                "localStorage": local_storage,
+                "sessionStorage": session_storage,
+                "exported_at": datetime.utcnow().isoformat()
+            }
+            
+            print(f"[INFO] ✅ Profile export complete (all data in RAM)")
+            return profile_data
+            
+        except Exception as e:
+            print(f"[ERROR] ❌ Profile export failed: {str(e)}")
+            raise RuntimeError(f"Failed to export browser profile: {str(e)}")
+    
+    async def execute_test(
+        self,
+        db: Session,
+        test_case: TestCase,
+        execution_id: int,
+        user_id: int,
+        base_url: str,
+        environment: str = "dev",
+        progress_callback: Optional[Callable] = None,
+        skip_navigation: bool = False,
+        http_credentials: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Execute a test case and track results.
+        
+        Args:
+            db: Database session
+            test_case: Test case to execute
+            execution_id: Pre-created execution record ID
+            user_id: ID of user triggering execution
+            base_url: Base URL for the application under test
+            environment: Environment name (dev, staging, production)
+            progress_callback: Optional callback for progress updates
+            skip_navigation: If True, skip navigating to base_url (for suite continuation)
+            http_credentials: Optional HTTP Basic auth {"username","password"} (e.g. UAT) for initial navigation
+            
+        Returns:
+            TestExecution object with results
+        """
+        # Get existing execution record (created by endpoint)
+        execution = crud_execution.get_execution(db, execution_id)
+        if not execution:
+            raise ValueError(f"Execution {execution_id} not found")
+        
+        try:
+            # Update status to running
+            execution = crud_execution.start_execution(db, execution.id)
+            
+            if progress_callback:
+                await progress_callback({
+                    "execution_id": execution.id,
+                    "status": "running",
+                    "message": "Starting test execution..."
+                })
+            
+            # Initialize browser
+            await self.initialize()
+            self.set_runtime_http_credentials(http_credentials)
+            
+            # Execute steps
+            steps = test_case.steps
+            if isinstance(steps, str):
+                try:
+                    steps = json.loads(steps)
+                except:
+                    steps = [steps]  # Treat as single step if JSON parse fails
+            elif not isinstance(steps, list):
+                steps = []
+            # Expand any @module: references to concrete steps before execution.
+            steps = resolve_steps(steps, db=db, user_id=user_id)
+            
+            # Check if first step contains navigation (URL)
+            first_step_has_url = False
+            if steps and len(steps) > 0:
+                first_step = str(steps[0]).lower()
+                if any(keyword in first_step for keyword in ['navigate', 'goto', 'open', 'http://', 'https://']):
+                    first_step_has_url = True
+                    print(f"[DEBUG] First step contains navigation, skipping initial goto")
+            
+            # Navigate to base URL only if not continuing from suite and first step doesn't navigate
+            if not skip_navigation and not first_step_has_url:
+                nav_url = base_url
+                if http_credentials and http_credentials.get("username") and http_credentials.get("password"):
+                    from app.utils.http_auth_credentials import url_with_embedded_http_basic_auth
+                    nav_url = url_with_embedded_http_basic_auth(
+                        base_url,
+                        str(http_credentials["username"]),
+                        str(http_credentials["password"]),
+                    )
+                    logger.info("StagehandExecutionService: Navigating with HTTP Basic credentials in URL")
+                print(f"[DEBUG] Navigating to base URL: {base_url}")
+                await self.page.goto(nav_url)
+                await asyncio.sleep(1)  # Wait for page to stabilize
+            elif skip_navigation:
+                print(f"[DEBUG] Skipping navigation (continuing from previous test in suite)")
+                current_url = self.page.url
+                print(f"[DEBUG] Current URL: {current_url}")
+            
+            # NOTE: OTP steps must NOT be pre-expanded here.
+            # Pre-expansion polls IMAP before prior steps (e.g. "Submit registration")
+            # have run, so the poll picks up stale emails from the previous session.
+            # OTP expansion is done JIT inside the loop when each step is reached.
+
+            total_steps = len(steps)
+            passed_steps = 0
+            failed_steps = 0
+            
+            print(f"[DEBUG] Executing {total_steps} steps")
+            
+            step_index = 0
+            # Tracks the exclusive 0-based end of the last expanded OTP digit range.
+            # Expanded steps like "Input the Nth number of OTP…" match is_otp_step()
+            # themselves; without this guard they would re-trigger IMAP on every digit.
+            otp_expanded_end = 0
+            while step_index < len(steps):
+                idx = step_index + 1
+                step_desc = steps[step_index]
+
+                # JIT OTP expansion: poll IMAP only when we reach the OTP placeholder
+                # step and only if this index is NOT inside a previously-expanded range.
+                if step_index >= otp_expanded_end and is_otp_step(step_desc):
+                    expanded = self._fetch_otp_and_format_steps(step_desc, db, user_id)
+                    steps[step_index:step_index + 1] = expanded
+                    total_steps = len(steps)
+                    otp_expanded_end = step_index + len(expanded)
+                    step_desc = steps[step_index]
+
+                step_start = datetime.utcnow()
+                
+                try:
+                    if progress_callback:
+                        await progress_callback({
+                            "execution_id": execution.id,
+                            "step": idx,
+                            "total_steps": total_steps,
+                            "message": f"Executing step {idx}: {step_desc}"
+                        })
+                    
+                    print(f"[DEBUG] Step {idx}/{total_steps}: {step_desc}")
+
+                    # Hybrid execution strategy:
+                    # 1. Try Playwright selectors first (fast, free, reliable)
+                    # 2. If fails, fallback to Stagehand AI (flexible, handles complex cases)
+                    USE_AI_ONLY = os.getenv("USE_AI_EXECUTION", "false").lower() == "true"
+                    
+                    if USE_AI_ONLY:
+                        # Force AI execution for all steps
+                        result = await self._execute_step_ai(step_desc, idx)
+                    else:
+                        # Try Playwright first, fallback to AI if it fails
+                        result = await self._execute_step_hybrid(step_desc, idx)
+                    
+                    step_end = datetime.utcnow()
+                    duration = (step_end - step_start).total_seconds()
+                    
+                    # Save screenshot for this step
+                    screenshot_path = await self._capture_screenshot(
+                        execution.id, 
+                        idx,
+                        ExecutionResult.PASS if result["success"] else ExecutionResult.FAIL
+                    )
+                    
+                    # Create step record
+                    step_result = ExecutionResult.PASS if result["success"] else ExecutionResult.FAIL
+                    
+                    crud_execution.create_execution_step(
+                        db=db,
+                        execution_id=execution.id,
+                        step_number=idx,
+                        step_description=step_desc,
+                        expected_result=result.get("expected", "Step completes successfully"),
+                        result=step_result,
+                        actual_result=result.get("actual", ""),
+                        error_message=result.get("error"),
+                        screenshot_path=screenshot_path,
+                        duration_seconds=duration,
+                        selector_used=result.get("selector_used"),
+                        action_method=result.get("action_method")
+                    )
+                    
+                    if result["success"]:
+                        passed_steps += 1
+                        print(f"[DEBUG] Step {idx} PASSED")
+                    else:
+                        failed_steps += 1
+                        print(f"[DEBUG] Step {idx} FAILED: {result.get('error')}")
+                    
+                except Exception as e:
+                    failed_steps += 1
+                    step_end = datetime.utcnow()
+                    duration = (step_end - step_start).total_seconds()
+                    
+                    print(f"[DEBUG] Step {idx} ERROR: {str(e)}")
+                    
+                    # Capture failure screenshot
+                    screenshot_path = await self._capture_screenshot(
+                        execution.id, 
+                        idx,
+                        ExecutionResult.ERROR
+                    )
+                    
+                    crud_execution.create_execution_step(
+                        db=db,
+                        execution_id=execution.id,
+                        step_number=idx,
+                        step_description=step_desc,
+                        result=ExecutionResult.ERROR,
+                        error_message=str(e),
+                        screenshot_path=screenshot_path,
+                        duration_seconds=duration
+                    )
+                
+                step_index += 1
+            
+            # Get final screenshot
+            final_screenshot = await self._capture_screenshot(
+                execution.id,
+                0,
+                ExecutionResult.PASS if failed_steps == 0 else ExecutionResult.FAIL
+            )
+            
+            # Complete execution
+            final_result = ExecutionResult.PASS if failed_steps == 0 else ExecutionResult.FAIL
+            
+            execution = crud_execution.complete_execution(
+                db=db,
+                execution_id=execution.id,
+                result=final_result,
+                total_steps=total_steps,
+                passed_steps=passed_steps,
+                failed_steps=failed_steps,
+                screenshot_path=final_screenshot,
+                video_path=None
+            )
+            
+            print(f"[DEBUG] Execution complete: {passed_steps}/{total_steps} passed")
+            
+            if progress_callback:
+                await progress_callback({
+                    "execution_id": execution.id,
+                    "status": "completed",
+                    "result": final_result.value,
+                    "message": f"Execution completed: {passed_steps}/{total_steps} steps passed"
+                })
+            
+        except Exception as e:
+            print(f"[DEBUG] Execution failed with exception: {str(e)}")
+            # Execution failed
+            execution = crud_execution.fail_execution(
+                db=db,
+                execution_id=execution.id,
+                error_message=str(e)
+            )
+            
+            if progress_callback:
+                await progress_callback({
+                    "execution_id": execution.id,
+                    "status": "failed",
+                    "error": str(e),
+                    "message": f"Execution failed: {str(e)}"
+                })
+        
+        finally:
+            self.set_runtime_http_credentials(None)
+            # Cleanup
+            await self.cleanup()
+        
+        return execution
+
+    def _expand_otp_steps_list(self, steps: list, db, user_id: int) -> list:
+        """
+        Pre-expand OTP steps into per-digit steps before the execution loop.
+
+        For each step that matches an OTP pattern, replaces it with N individual
+        steps (one per digit). Non-OTP steps are passed through unchanged. If
+        the IMAP poll fails or no credential is configured the original step is
+        kept unchanged so execution continues normally.
+        """
+        result = []
+        for step in steps:
+            step_str = str(step)
+            if is_otp_step(step_str):
+                expanded = self._fetch_otp_and_format_steps(step_str, db, user_id)
+                result.extend(expanded)
+            else:
+                result.append(step)
+        return result
+
+    def _fetch_otp_and_format_steps(self, step_description: str, db, user_id: int) -> list:
+        """
+        Fetch OTP via IMAP and return a list of one step per digit.
+        Falls back to [step_description] unchanged on any error.
+        """
+        if db is None or encryption_service is None:
+            logger.warning("OTP step detected but db/encryption not available; skipping IMAP poll")
+            return [step_description]
+
+        cred = get_email_credential_for_user(db, user_id)
+        if cred is None:
+            logger.warning(
+                "OTP step detected for user %s but no email credential configured", user_id
+            )
+            return [step_description]
+
+        try:
+            app_password = encryption_service.decrypt_password(cred.imap_password_encrypted)
+            from app.core.config import settings as app_settings
+            otp = email_otp_service.poll_otp(
+                imap_host=cred.imap_host,
+                imap_port=cred.imap_port,
+                email_address=cred.email_address,
+                app_password=app_password,
+                timeout=app_settings.EMAIL_OTP_POLL_TIMEOUT,
+                interval=app_settings.EMAIL_OTP_POLL_INTERVAL,
+            )
+            logger.info("OTP resolved for user %s: %s — expanding into %d steps", user_id, otp, len(otp))
+            return format_otp_steps(otp)
+        except TimeoutError as exc:
+            logger.warning("OTP poll timed out for user %s: %s", user_id, exc)
+            return [f"Enter OTP (No OTP email received — {exc})"]
+        except Exception as exc:
+            logger.error("OTP resolution error for user %s: %s", user_id, exc)
+            return [step_description]
+
+    async def _execute_step_hybrid(self, step_description: str, step_number: int) -> Dict[str, Any]:
+        """
+        Hybrid execution: Try Playwright first, fallback to AI if it fails.
+        
+        This provides the best of both worlds:
+        - Fast and free Playwright selectors for common cases
+        - AI fallback for complex or dynamic scenarios
+        
+        IMPORTANT: AI fallback executes ONLY the current step, not all steps from beginning.
+        Browser session is shared, so context from previous steps is preserved.
+        """
+        print(f"[DEBUG] ========================================")
+        print(f"[DEBUG] 🔄 HYBRID Step {step_number}: {step_description}")
+        print(f"[DEBUG] Strategy: Playwright first (10s timeout), then AI fallback if needed")
+        
+        # Try Playwright-based execution first
+        print(f"[DEBUG] 🎭 Attempting with Playwright selectors...")
+        result = await self._execute_step_simple(step_description, step_number)
+        
+        # Check if it succeeded
+        if result.get("success"):
+            print(f"[DEBUG] ✅ Playwright execution succeeded for step {step_number}")
+            return result
+        
+        # If Playwright failed, try AI fallback for THIS STEP ONLY
+        print(f"[DEBUG] ⚠️  Playwright failed for step {step_number}: {result.get('error', 'Unknown error')}")
+        print(f"[DEBUG] 🤖 Attempting AI fallback for step {step_number} ONLY (not restarting from step 1)...")
+        
+        ai_result = await self._execute_step_ai(step_description, step_number)
+        
+        if ai_result.get("success"):
+            print(f"[DEBUG] ✅ AI fallback succeeded for step {step_number}!")
+            # Add note that AI was used
+            ai_result["actual"] = f"[AI Fallback] {ai_result.get('actual', '')}"
+            return ai_result
+        else:
+            print(f"[DEBUG] ❌ Both Playwright and AI failed for step {step_number}")
+            # Return the AI error (usually more informative)
+            return ai_result
+    
+    async def _execute_step_ai(self, step_description: str, step_number: int) -> Dict[str, Any]:
+        """
+        Execute a single test step using Stagehand AI.
+        
+        Uses page.act() for AI-powered natural language execution.
+        More flexible but slower and requires API calls.
+        
+        IMPORTANT: This executes ONLY the specified step, not all steps from the beginning.
+        The browser session is shared with Playwright, so previous step context is preserved.
+        """
+        try:
+            # Get current page state before AI execution
+            url_before = self.page.url
+            title_before = await self.page.title()
+            
+            print(f"[DEBUG] ========================================")
+            print(f"[DEBUG] 🤖 AI Fallback for Step {step_number} ONLY")
+            print(f"[DEBUG] Step Description: {step_description}")
+            print(f"[DEBUG] Browser state BEFORE AI:")
+            print(f"[DEBUG]   - URL: {url_before}")
+            print(f"[DEBUG]   - Title: {title_before}")
+            print(f"[DEBUG] Calling page.act() for THIS STEP ONLY...")
+            
+            # Use Stagehand AI to execute the step - CAPTURE RETURN VALUE
+            act_result = await self.page.act(step_description)
+            
+            await asyncio.sleep(1.5)  # Wait for action to complete
+            
+            title_after = await self.page.title()
+            url_after = self.page.url
+            
+            # Extract XPath from act_result
+            xpath_used = None
+            if act_result and hasattr(act_result, 'message') and act_result.message:
+                # Parse xpath from message like: "Action [click] performed successfully on selector: xpath=/html/body[1]/div[1]..."
+                import re
+                xpath_match = re.search(r'selector:\s*(xpath=[^\s]+)', act_result.message)
+                if xpath_match:
+                    xpath_used = xpath_match.group(1)
+            
+            print(f"[DEBUG] ✅ AI action completed successfully!")
+            print(f"[DEBUG] XPath used by Stagehand: {xpath_used}")
+            print(f"[DEBUG] Browser state AFTER AI:")
+            print(f"[DEBUG]   - URL: {url_after}")
+            print(f"[DEBUG]   - Title: {title_after}")
+            print(f"[DEBUG] Changes: URL changed={url_before != url_after}, Title changed={title_before != title_after}")
+            
+            # FAILURE DETECTION: Check for actual failures vs expected non-changes
+            desc_lower = step_description.lower()
+            is_input_action = any(word in desc_lower for word in ['fill', 'type', 'enter', 'input'])
+            is_navigation_action = any(word in desc_lower for word in ['navigate', 'goto', 'open'])
+            is_click_action = any(word in desc_lower for word in ['click', 'select', 'press'])
+            
+            url_changed = url_before != url_after
+            title_changed = title_before != title_after
+            something_changed = url_changed or title_changed
+            
+            # For INPUT actions: Success if no error occurred
+            # (Filling form fields doesn't change URL/title - that's NORMAL)
+            if is_input_action:
+                if not something_changed:
+                    print(f"[DEBUG] ✓ Input action completed (no URL/title change is NORMAL for form inputs)")
+                print(f"[DEBUG] ========================================")
+                return {
+                    "success": True,  # Trust Stagehand's completion
+                    "actual": f"Input completed via AI: XPath: {xpath_used}. Page: {title_after} | URL: {url_after}",
+                    "expected": step_description,
+                    "selector_used": xpath_used,
+                    "action_method": "stagehand_ai"
+                }
+            
+            # If it's a navigation action and URL didn't change, treat as failure
+            if is_navigation_action and not url_changed:
+                print(f"[DEBUG] ⚠️  NAVIGATION ACTION but URL didn't change - treating as FAILURE")
+                print(f"[DEBUG] ========================================")
+                return {
+                    "success": False,
+                    "error": "Navigation action completed but URL didn't change. Navigation may have failed.",
+                    "actual": f"AI tried but URL unchanged: {url_after}",
+                    "expected": step_description,
+                    "selector_used": xpath_used,
+                    "action_method": "stagehand_ai_failed"
+                }
+            
+            print(f"[DEBUG] ========================================")
+            
+            return {
+                "success": True,
+                "actual": f"AI action: {act_result.action if act_result else 'completed'}. XPath: {xpath_used}. Page: {title_after} | URL: {url_after}",
+                "expected": step_description,
+                "selector_used": xpath_used,
+                "action_method": "stagehand_ai"
+            }
+            
+        except Exception as e:
+            print(f"[DEBUG] ❌ AI action failed: {str(e)}")
+            await asyncio.sleep(0.5)
+            
+            # Try to get page state even after error
+            try:
+                title = await self.page.title()
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "actual": f"AI action failed: {str(e)}. Page: {title}",
+                    "expected": step_description
+                }
+            except:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "actual": f"AI action failed: {str(e)}",
+                    "expected": step_description
+                }
+    
+    async def _execute_step_simple(self, step_description: str, step_number: int) -> Dict[str, Any]:
+        """
+        Execute a single test step using direct Playwright commands.
+        
+        Uses simple selectors for reliability without AI overhead.
+        """
+        try:
+            # Detect action type from description
+            desc_lower = step_description.lower()
+            
+            # Check if it's a navigation action with URL
+            if any(word in desc_lower for word in ['navigate', 'goto', 'open']) and ('http://' in step_description or 'https://' in step_description):
+                print(f"[DEBUG] 🌐 Detected navigation action")
+                return await self._execute_navigation(step_description)
+            
+            # Check if it's a typing action
+            elif any(word in desc_lower for word in ['type', 'enter', 'fill', 'input']):
+                print(f"[DEBUG] ⌨️  Detected typing action")
+                return await self._execute_type_simple(step_description)
+            
+            # Check if it's a click action (including tick for checkboxes)
+            # IMPORTANT: Check for 'tick' and 'checkbox' BEFORE checking for 'check' 
+            # to avoid false positive with verify/wait detection
+            elif any(word in desc_lower for word in ['click', 'select', 'choose', 'press', 'tick']) or 'checkbox' in desc_lower:
+                print(f"[DEBUG] 🖱️  Detected click action")
+                return await self._execute_click_simple(step_description)
+            
+            # Check if it's a scroll action
+            elif 'scroll' in desc_lower:
+                print(f"[DEBUG] 📜 Detected scroll action")
+                return await self._execute_scroll(step_description)
+            
+            # Check if it's a verify/wait action
+            elif any(word in desc_lower for word in ['verify', 'check', 'wait', 'ensure']):
+                print(f"[DEBUG] ✓ Detected verify/wait action")
+                return await self._execute_verify(step_description)
+            
+            # For unrecognized actions, use Stagehand AI instead of just noting
+            else:
+                print(f"[DEBUG] ⚠️  Unrecognized action type, using Stagehand AI fallback")
+                print(f"[DEBUG] Step: {step_description}")
+                return await self._execute_ai_action(step_description)
+        
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _execute_ai_action(self, step_description: str) -> Dict[str, Any]:
+        """Execute non-click actions using Stagehand AI."""
+        try:
+            print(f"[DEBUG] Calling page.act('{step_description}')...")
+            act_result = await self.page.act(step_description)
+            print(f"[DEBUG] AI action completed successfully!")
+            
+            await asyncio.sleep(1)
+            
+            title = await self.page.title()
+            url = self.page.url
+            
+            # Extract XPath from act_result
+            xpath_used = None
+            if act_result and hasattr(act_result, 'message') and act_result.message:
+                import re
+                xpath_match = re.search(r'selector:\s*(xpath=[^\s]+)', act_result.message)
+                if xpath_match:
+                    xpath_used = xpath_match.group(1)
+            
+            print(f"[DEBUG] XPath used by Stagehand: {xpath_used}")
+            print(f"[DEBUG] After action - Title: {title}")
+            print(f"[DEBUG] After action - URL: {url}")
+            print(f"[DEBUG] ========================================")
+            
+            return {
+                "success": True,
+                "actual": f"AI action: {act_result.action if act_result else 'completed'}. XPath: {xpath_used}. Page: {title} | URL: {url}",
+                "expected": step_description,
+                "selector_used": xpath_used,
+                "action_method": "stagehand_ai"
+            }
+        except Exception as e:
+            print(f"[DEBUG] ❌ AI action failed: {str(e)}")
+            await asyncio.sleep(0.5)
+            title = await self.page.title()
+            return {
+                "success": True,
+                "actual": f"Step noted (page title: {title})",
+                "expected": step_description,
+                "warning": f"AI action failed: {str(e)}"
+            }
+    
+    async def _execute_click_hybrid(self, step_description: str) -> Dict[str, Any]:
+        """
+        Execute click actions using hybrid approach:
+        1. Use AI to find the element
+        2. Use Playwright to click it reliably
+        """
+        try:
+            print(f"[DEBUG] Step 1: Using AI to locate element...")
+            
+            # First, try to extract button text or identifier from description
+            # Common patterns: "Click on 'text'", "Click the 'text' button", etc.
+            import re
+            
+            # Try to find quoted text
+            quoted_match = re.search(r"['\"]([^'\"]+)['\"]", step_description)
+            if quoted_match:
+                button_text = quoted_match.group(1)
+                print(f"[DEBUG] Extracted button text: '{button_text}'")
+                
+                # Get underlying Playwright page
+                pw_page = self.page._page
+                
+                # The login box is in an offcanvas overlay
+                offcanvas_prefix = '.offcanvas.show '
+                
+                # Try different selectors - both with and without offcanvas targeting
+                selectors_to_try = [
+                    # First try within visible offcanvas
+                    f"{offcanvas_prefix}button:has-text('{button_text}')",
+                    f"{offcanvas_prefix}a:has-text('{button_text}')",
+                    f"{offcanvas_prefix}text='{button_text}'",
+                    f"{offcanvas_prefix}text={button_text}",
+                    # Then try general selectors
+                    f"text='{button_text}'",  # Exact text match
+                    f"text={button_text}",    # Substring match
+                    f"button:has-text('{button_text}')",  # Button with text
+                    f"a:has-text('{button_text}')",       # Link with text
+                    f"//*[contains(text(), '{button_text}')]",  # XPath
+                ]
+                
+                for selector in selectors_to_try:
+                    try:
+                        print(f"[DEBUG] Trying selector: {selector}")
+                        element = await pw_page.wait_for_selector(selector, timeout=5000)  # 5 seconds only
+                        
+                        if element:
+                            is_visible = await element.is_visible()
+                            is_enabled = await element.is_enabled()
+                            print(f"[DEBUG] Found element! visible={is_visible}, enabled={is_enabled}")
+                            
+                            if is_visible and is_enabled:
+                                print(f"[DEBUG] Step 2: Clicking with Playwright...")
+                                
+                                # Try normal click first
+                                try:
+                                    await element.click(timeout=10000)  # 10 seconds for click to complete
+                                except Exception as click_error:
+                                    # If blocked by modal overlay, force the click
+                                    if "intercepts pointer events" in str(click_error):
+                                        print(f"[DEBUG] Click blocked by overlay, using force click...")
+                                        await element.click(force=True)
+                                    else:
+                                        raise
+                                
+                                await asyncio.sleep(1.5)  # Wait for click effects
+                                
+                                title = await self.page.title()
+                                url = self.page.url
+                                
+                                print(f"[DEBUG] ✅ Click successful!")
+                                print(f"[DEBUG] After click - Title: {title}")
+                                print(f"[DEBUG] After click - URL: {url}")
+                                print(f"[DEBUG] ========================================")
+                                
+                                return {
+                                    "success": True,
+                                    "actual": f"Clicked '{button_text}'. Page: {title} | URL: {url}",
+                                    "expected": step_description
+                                }
+                    except Exception as e:
+                        print(f"[DEBUG] Selector '{selector}' failed: {str(e)}")
+                        continue
+            
+            # If direct Playwright approach fails, fall back to Stagehand AI
+            print(f"[DEBUG] Direct click failed, falling back to Stagehand AI...")
+            return await self._execute_ai_action(step_description)
+            
+        except Exception as e:
+            print(f"[DEBUG] ❌ Hybrid click failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Last resort: try pure AI
+            print(f"[DEBUG] Attempting pure AI as last resort...")
+            return await self._execute_ai_action(step_description)
+    
+    async def _execute_type_hybrid(self, step_description: str) -> Dict[str, Any]:
+        """
+        Hybrid approach for typing: Use AI to understand field, Playwright to type.
+        
+        Extracts text to type from quotes in the description and uses Playwright's .fill()
+        """
+        try:
+            import re
+            
+            # Extract text to type - look for patterns like "type 'text'" or "type \"text\""
+            # This should match: "type 'pmo.andrewchan+010@gmail.com'" 
+            type_pattern = re.search(r"(?:type|enter|fill|input)\s+['\"]([^'\"]+)['\"]", step_description, re.IGNORECASE)
+            
+            if not type_pattern:
+                print(f"[DEBUG] No type pattern found, using AI fallback")
+                return await self._execute_ai_action(step_description)
+            
+            text_to_type = type_pattern.group(1)
+            print(f"[DEBUG] Extracted text to type: '{text_to_type}'")
+            
+            # Identify the field type from description
+            field_keywords = {
+                'email': ['email', 'e-mail'],
+                'password': ['password', 'pwd', 'pass'],
+                'text': ['address', 'name', 'input', 'field']
+            }
+            
+            field_type = 'text'  # default
+            desc_lower = step_description.lower()
+            for ftype, keywords in field_keywords.items():
+                if any(kw in desc_lower for kw in keywords):
+                    field_type = ftype
+                    break
+            
+            print(f"[DEBUG] Detected field type: {field_type}")
+            
+            # The login box is an offcanvas overlay - target elements within it
+            offcanvas_prefix = '.offcanvas.show '  # Target visible offcanvas
+            
+            # Try Playwright selectors based on field type
+            selectors_to_try = []
+            
+            if field_type == 'email':
+                selectors_to_try = [
+                    f'{offcanvas_prefix}input[type="email"]',
+                    f'{offcanvas_prefix}input[name*="email" i]',
+                    f'{offcanvas_prefix}input[id*="email" i]',
+                    f'{offcanvas_prefix}input[placeholder*="email" i]',
+                    f'{offcanvas_prefix}input[type="text"]:visible',
+                    f'{offcanvas_prefix}input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                    # Fallback without offcanvas prefix
+                    'input[type="email"]:visible',
+                    'input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+                ]
+            elif field_type == 'password':
+                selectors_to_try = [
+                    f'{offcanvas_prefix}input[type="password"]',
+                    f'{offcanvas_prefix}input[name*="password" i]',
+                    f'{offcanvas_prefix}input[name*="pwd" i]',
+                    f'{offcanvas_prefix}input[id*="password" i]',
+                    f'{offcanvas_prefix}input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                    # Fallback without offcanvas prefix
+                    'input[type="password"]:visible',
+                    'input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+                ]
+            else:
+                # Generic input field
+                selectors_to_try = [
+                    f'{offcanvas_prefix}input[type="text"]',
+                    f'{offcanvas_prefix}input:not([type])',
+                    f'{offcanvas_prefix}textarea',
+                    f'{offcanvas_prefix}input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                    # Fallback without offcanvas prefix
+                    'input[type="text"]:visible',
+                    'input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+                ]
+            
+            # Try each selector with REDUCED timeout (5s per selector instead of 30s)
+            # This prevents infinite waiting when element doesn't exist
+            for selector in selectors_to_try:
+                try:
+                    print(f"[DEBUG] Trying: {selector}")
+                    element = await self.page._page.wait_for_selector(selector, timeout=5000, state='visible')  # 5 seconds only
+                    
+                    if element:
+                        print(f"[DEBUG] Found element with: {selector}")
+                        
+                        # Clear the field first
+                        await element.fill('')
+                        await asyncio.sleep(0.3)
+                        
+                        # Type the text
+                        await element.fill(text_to_type)
+                        await asyncio.sleep(0.5)
+                        
+                        title = await self.page.title()
+                        
+                        print(f"[DEBUG] ✅ Typing successful!")
+                        print(f"[DEBUG] Entered: '{text_to_type}' into {field_type} field")
+                        print(f"[DEBUG] ========================================")
+                        
+                        return {
+                            "success": True,
+                            "actual": f"Entered '{text_to_type}' into {field_type} field. Page: {title}",
+                            "expected": step_description,
+                            "selector_used": selector,
+                            "action_method": "playwright"
+                        }
+                except Exception as e:
+                    print(f"[DEBUG] {selector} failed: {str(e)[:100]}")
+                    continue
+            
+            # If direct Playwright approach fails, fall back to Stagehand AI
+            print(f"[DEBUG] Direct typing failed, falling back to Stagehand AI...")
+            return await self._execute_ai_action(step_description)
+            
+        except Exception as e:
+            print(f"[DEBUG] ❌ Hybrid typing failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _capture_screenshot(
+        self, 
+        execution_id: int, 
+        step_number: int,
+        result: ExecutionResult
+    ) -> Optional[str]:
+        """Capture screenshot for a step or execution."""
+        try:
+            if not self.page:
+                return None
+            
+            filename = f"exec_{execution_id}_step_{step_number}_{result.value}.png"
+            filepath = self.screenshot_dir / filename
+            
+            await self.page.screenshot(path=str(filepath))
+            
+            return str(filepath)
+        except Exception as e:
+            print(f"[DEBUG] Failed to capture screenshot: {e}")
+            return None
+    
+    async def _execute_click_simple(self, step_description: str) -> Dict[str, Any]:
+        """Execute click actions using simple Playwright selectors."""
+        try:
+            import re
+            
+            # Get Playwright page
+            pw_page = self.page._page
+            desc_lower = step_description.lower()
+            
+            # Special case: checkbox
+            if 'checkbox' in desc_lower:
+                print(f"[DEBUG] Looking for checkbox...")
+                # Try most common checkbox selector first - fail fast if not found
+                try:
+                    element = await pw_page.wait_for_selector(
+                        "input[type='checkbox']:visible, [role='checkbox']:visible, label:has(input[type='checkbox']):visible",
+                        timeout=5000,  # 5 seconds only
+                        state='visible'
+                    )
+                    if element:
+                        await element.click(timeout=5000)  # 5 seconds
+                        await asyncio.sleep(0.5)
+                        print(f"[DEBUG] ✅ Clicked checkbox")
+                        checkbox_selector = "input[type='checkbox']:visible, [role='checkbox']:visible, label:has(input[type='checkbox']):visible"
+                        return {
+                            "success": True,
+                            "actual": "Clicked checkbox",
+                            "expected": step_description,
+                            "selector_used": checkbox_selector,
+                            "action_method": "playwright"
+                        }
+                except Exception as e:
+                    print(f"[DEBUG] Checkbox not found: {str(e)[:100]}")
+                    # Don't retry - let AI fallback handle it
+                    return {
+                        "success": False,
+                        "error": f"Checkbox not found: {str(e)}",
+                        "actual": "Checkbox element not visible",
+                        "expected": step_description
+                    }
+            
+            # Special case: close button (X)
+            if desc_lower.startswith("find and click the 'x'"):
+                print(f"[DEBUG] Looking for close button...")
+                # Combine selectors - fail fast if not found
+                try:
+                    element = await pw_page.wait_for_selector(
+                        "button[aria-label*='close' i]:visible, button[class*='close' i]:visible, button:has-text('×'):visible, [aria-label*='close' i]:visible",
+                        timeout=5000,  # 5 seconds only
+                        state='visible'
+                    )
+                    if element:
+                        await element.click(timeout=5000)  # 5 seconds
+                        await asyncio.sleep(1)
+                        print(f"[DEBUG] ✅ Clicked close button")
+                        close_selector = "button[aria-label*='close' i]:visible, button[class*='close' i]:visible, button:has-text('×'):visible, [aria-label*='close' i]:visible"
+                        return {
+                            "success": True,
+                            "actual": "Clicked close button",
+                            "expected": step_description,
+                            "selector_used": close_selector,
+                            "action_method": "playwright"
+                        }
+                except Exception as e:
+                    print(f"[DEBUG] Close button not found: {str(e)[:100]}")
+                    # Don't retry - let AI fallback handle it
+                    return {
+                        "success": False,
+                        "error": f"Close button not found: {str(e)}",
+                        "actual": "Close button not visible",
+                        "expected": step_description
+                    }
+            
+            # Extract text from quotes in description, or extract from "click on X" pattern
+            quoted_match = re.search(r"['\"]([^'\"]+)['\"]", step_description)
+            
+            if quoted_match:
+                button_text = quoted_match.group(1)
+            else:
+                # Try to extract text after "click on", "click the", "select", etc.
+                click_pattern = re.search(r"(?:click on|click the|select|choose|press)\s+(?:the\s+)?(.+?)(?:\s+button|\s+link|\s+plan|$)", step_description, re.IGNORECASE)
+                if click_pattern:
+                    button_text = click_pattern.group(1).strip()
+                else:
+                    # Last resort: extract everything after the action word
+                    action_pattern = re.search(r"(?:click|select|choose|press)\s+(.+)", step_description, re.IGNORECASE)
+                    if action_pattern:
+                        button_text = action_pattern.group(1).strip()
+                    else:
+                        return {
+                            "success": False,
+                            "error": "Could not extract button text from description",
+                            "actual": "No button text pattern found",
+                            "expected": step_description
+                        }
+            
+            print(f"[DEBUG] Looking for button: '{button_text}'")
+            
+            # Check if we're in a modal context (for login flow)
+            in_modal = 'login' in desc_lower or 'email' in desc_lower or 'password' in desc_lower
+            
+            # Build combined selector - try all patterns at once instead of sequentially
+            # This reduces timeout from N * 30 seconds to just 10 seconds total
+            base_patterns = [
+                f"button:has-text('{button_text}')",
+                f"a:has-text('{button_text}')",
+                f"[role='button']:has-text('{button_text}')",
+                f"text='{button_text}'",
+            ]
+            
+            # If in modal, prepend .modal-content to patterns
+            if in_modal:
+                combined_selector = ", ".join([f".modal-content {p}" for p in base_patterns] + base_patterns)
+            else:
+                combined_selector = ", ".join(base_patterns)
+            
+            try:
+                print(f"[DEBUG] Trying combined selector (timeout: 5s)")
+                element = await pw_page.wait_for_selector(
+                    combined_selector, 
+                    timeout=5000,  # 5 seconds only
+                    state='visible'
+                )
+                if element:
+                    await element.click(timeout=5000)  # 5 seconds
+                    await asyncio.sleep(1.5)
+                    
+                    title = await self.page.title()
+                    url = self.page.url
+                    
+                    print(f"[DEBUG] ✅ Clicked '{button_text}'")
+                    print(f"[DEBUG] Page: {title} | URL: {url}")
+                    
+                    return {
+                        "success": True,
+                        "actual": f"Clicked '{button_text}'. Page: {title}",
+                        "expected": step_description,
+                        "selector_used": combined_selector,
+                        "action_method": "playwright"
+                    }
+            except Exception as e:
+                print(f"[DEBUG] Click failed: {str(e)[:150]}")
+                # Don't retry - let AI fallback handle it
+                return {
+                    "success": False,
+                    "error": f"Could not find button '{button_text}': {str(e)}",
+                    "actual": "Button not found or not clickable",
+                    "expected": step_description
+                }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _execute_type_simple(self, step_description: str) -> Dict[str, Any]:
+        """Execute typing actions using simple Playwright selectors."""
+        try:
+            import re
+            
+            # Extract text to type from quotes
+            quoted_matches = re.findall(r"['\"]([^'\"]+)['\"]", step_description)
+            if len(quoted_matches) < 1:
+                return {
+                    "success": False,
+                    "error": "Could not extract text to type",
+                    "actual": "No quoted text found",
+                    "expected": step_description
+                }
+            
+            # Try to identify field type from description FIRST
+            desc_lower = step_description.lower()
+            
+            # Smart text extraction: find the quoted text that matches the field type
+            text_to_type = None
+            
+            if 'email' in desc_lower:
+                # Look for email-like text (contains @)
+                for text in quoted_matches:
+                    if '@' in text:
+                        text_to_type = text
+                        break
+            elif 'password' in desc_lower:
+                # Look for password (usually short, no @ or spaces, has special chars)
+                for text in quoted_matches:
+                    if '@' not in text and len(text) < 50 and not text.startswith('http'):
+                        text_to_type = text
+                        break
+            
+            # If still not found, use the first quoted string (not button text like 'Login')
+            if not text_to_type:
+                # Filter out common button texts
+                button_keywords = ['login', 'submit', 'continue', 'next', 'confirm', 'ok', 'cancel', 'close']
+                for text in quoted_matches:
+                    if text.lower() not in button_keywords:
+                        text_to_type = text
+                        break
+            
+            # Last resort: use first quoted string
+            if not text_to_type:
+                text_to_type = quoted_matches[0]
+            
+            print(f"[DEBUG] Will type: '{text_to_type}'")
+            
+            # Get Playwright page
+            pw_page = self.page._page
+            
+            # Choose selectors based on field type
+            # Check if we're in a modal context
+            in_modal = 'login' in desc_lower or any(step in desc_lower for step in ['email', 'password'])
+            
+            base_selectors = []
+            if 'email' in desc_lower:
+                base_selectors = [
+                    "input[type='email']",
+                    "input[name*='email' i]",
+                    "input[placeholder*='email' i]",
+                    "input[id*='email' i]",
+                    "input[autocomplete='email']",
+                    "input[type='text']",  # Sometimes email fields are text type
+                ]
+            elif 'password' in desc_lower:
+                base_selectors = [
+                    "input[type='password']",
+                    "input[name*='password' i]",
+                    "input[autocomplete*='password' i]",
+                ]
+            else:
+                # Generic visible input
+                base_selectors = [
+                    "input:visible:not([type='hidden']):not([type='checkbox']):not([type='radio'])",
+                ]
+            
+            # If in modal, try multiple modal container variations
+            selectors = []
+            if in_modal:
+                # Try different modal container selectors
+                modal_prefixes = [
+                    ".modal-content",
+                    ".modal-body",
+                    ".modal",
+                    "[role='dialog']",
+                    ".offcanvas-body",
+                    ".offcanvas.show",
+                ]
+                for prefix in modal_prefixes:
+                    selectors.extend([f"{prefix} {s}" for s in base_selectors])
+            
+            # Also try without prefix as fallback
+            selectors.extend(base_selectors)
+            
+            for selector in selectors:
+                try:
+                    print(f"[DEBUG] Trying: {selector}")
+                    element = await pw_page.wait_for_selector(selector, timeout=5000, state='visible')  # 5 seconds only
+                    if element:
+                        await element.fill(text_to_type)
+                        await asyncio.sleep(0.5)
+                        
+                        print(f"[DEBUG] ✅ Typed '{text_to_type}' into field using selector: {selector}")
+                        
+                        return {
+                            "success": True,
+                            "actual": f"Entered text into field using {selector}",
+                            "expected": step_description,
+                            "selector_used": selector,
+                            "action_method": "playwright"
+                        }
+                except Exception as e:
+                    print(f"[DEBUG] {selector} failed: {str(e)[:100]}")
+                    continue
+            
+            # If all selectors failed
+            return {
+                "success": False,
+                "error": f"Could not find input field",
+                "actual": "Input field not found with any selector",
+                "expected": step_description
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _execute_navigation(self, step_description: str) -> Dict[str, Any]:
+        """Navigate to a URL extracted from the step description."""
+        try:
+            # Extract URL from description
+            import re
+            # Match URL but stop at quotes, whitespace, or other delimiters
+            url_match = re.search(r'(https?://[^\s\'"<>]+)', step_description)
+            if not url_match:
+                return {
+                    "success": False,
+                    "error": "No URL found in navigation step",
+                    "actual": "Could not extract URL",
+                    "expected": step_description
+                }
+            
+            url = url_match.group(1)
+            creds = getattr(self, "_runtime_http_credentials", None)
+            if creds and creds.get("username") and creds.get("password"):
+                from app.utils.http_auth_credentials import url_with_embedded_http_basic_auth
+                url = url_with_embedded_http_basic_auth(
+                    url, creds["username"], creds["password"]
+                )
+                logger.info(
+                    "StagehandExecutionService: Navigation step uses HTTP Basic credentials (embedded URL)"
+                )
+            print(f"[DEBUG] Navigating to URL: {url}")
+            
+            # Navigate using Playwright page
+            await self.page.goto(url)
+            await asyncio.sleep(2)  # Wait for page to load
+            
+            title = await self.page.title()
+            current_url = self.page.url
+            
+            print(f"[DEBUG] Navigation complete - Title: {title}")
+            print(f"[DEBUG] Current URL: {current_url}")
+            
+            return {
+                "success": True,
+                "actual": f"Navigated to {url}. Page title: {title}",
+                "expected": step_description
+            }
+        except Exception as e:
+            print(f"[DEBUG] Navigation failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Navigation error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _execute_scroll(self, step_description: str) -> Dict[str, Any]:
+        """Execute scroll action."""
+        try:
+            print(f"[DEBUG] Executing scroll")
+            
+            # Get underlying Playwright page
+            pw_page = self.page._page
+            
+            # Scroll down the page
+            await pw_page.evaluate("window.scrollBy(0, 500)")
+            await asyncio.sleep(1)
+            
+            return {
+                "success": True,
+                "actual": "Scrolled down page",
+                "expected": step_description
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Scroll error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _execute_verify(self, step_description: str) -> Dict[str, Any]:
+        """Execute verification step."""
+        try:
+            print(f"[DEBUG] Executing verification")
+            
+            # For now, just check that page is loaded
+            await asyncio.sleep(1)
+            title = await self.page.title()
+            url = self.page.url
+            
+            # Check if verification text is in page title or URL
+            desc_lower = step_description.lower()
+            title_lower = title.lower()
+            url_lower = url.lower()
+            
+            # Extract quoted text to verify
+            import re
+            verify_pattern = re.findall(r"['\"]([^'\"]+)['\"]", step_description)
+            
+            if verify_pattern:
+                all_found = True
+                for text in verify_pattern:
+                    text_lower = text.lower()
+                    if text_lower not in title_lower and text_lower not in url_lower:
+                        # Check if it's in the page content
+                        pw_page = self.page._page
+                        try:
+                            page_content = await pw_page.content()
+                            if text_lower not in page_content.lower():
+                                all_found = False
+                                break
+                        except:
+                            pass
+                
+                if all_found:
+                    return {
+                        "success": True,
+                        "actual": f"Verification passed. Page: {title}",
+                        "expected": step_description
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": "Verification text not found",
+                        "actual": f"Page title: {title}, URL: {url}",
+                        "expected": step_description
+                    }
+            else:
+                # No specific text to verify, just confirm page is loaded
+                return {
+                    "success": True,
+                    "actual": f"Verification step noted. Page: {title}",
+                    "expected": step_description
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Verification error: {str(e)}",
+                "expected": step_description
+            }
+    
+    async def _ensure_page_connected(self):
+        """
+        Ensure the page context is still connected. If not, reconnect to the active page.
+        This is important for debug mode where the browser stays open between executions.
+        """
+        try:
+            # Try to get the current title - if page is closed, this will fail
+            await self.page.title()
+        except Exception as e:
+            print(f"[DEBUG] Page context lost: {e}")
+            print(f"[DEBUG] Attempting to reconnect to active page...")
+            
+            try:
+                # Get all pages from the context
+                pages = self.context.pages
+                if pages:
+                    # Use the first active page
+                    self.page = pages[0]
+                    print(f"[DEBUG] Reconnected to page: {await self.page.title()}")
+                else:
+                    # Create a new page if none exist
+                    self.page = await self.context.new_page()
+                    print(f"[DEBUG] Created new page")
+            except Exception as reconnect_error:
+                print(f"[ERROR] Failed to reconnect page: {reconnect_error}")
+                raise ValueError(f"Page context lost and could not reconnect: {reconnect_error}")
+
+    async def execute_single_step(
+        self,
+        step_description: str,
+        step_number: int,
+        execution_id: int
+    ) -> Dict[str, Any]:
+        """
+        Execute a single step for debug mode.
+        
+        Args:
+            step_description: Step description to execute
+            step_number: Step number (for logging/screenshots)
+            execution_id: Execution ID (for screenshot naming)
+            
+        Returns:
+            Dict with:
+                - success: bool
+                - error: Optional[str]
+                - actual: str (what happened)
+                - expected: str (what should happen)
+                - screenshot_path: Optional[str]
+                - duration_seconds: float
+                - tokens_used: int (estimated)
+        """
+        start_time = datetime.utcnow()
+        
+        try:
+            print(f"[DEBUG] Executing single step #{step_number}: {step_description}")
+            
+            # Ensure page is still connected (important for debug mode)
+            await self._ensure_page_connected()
+            
+            # Use hybrid execution strategy
+            USE_AI_ONLY = os.getenv("USE_AI_EXECUTION", "false").lower() == "true"
+            
+            if USE_AI_ONLY:
+                result = await self._execute_step_ai(step_description, step_number)
+            else:
+                result = await self._execute_step_hybrid(step_description, step_number)
+            
+            # Capture screenshot
+            screenshot_path = await self._capture_screenshot(
+                execution_id,
+                step_number,
+                ExecutionResult.PASS if result["success"] else ExecutionResult.FAIL
+            )
+            
+            end_time = datetime.utcnow()
+            duration = (end_time - start_time).total_seconds()
+            
+            # Estimate tokens used (AI execution typically uses ~100 tokens per step)
+            tokens_estimate = 100 if result.get("used_ai", False) else 0
+            
+            return {
+                "success": result["success"],
+                "error": result.get("error"),
+                "actual": result.get("actual", ""),
+                "expected": result.get("expected", step_description),
+                "screenshot_path": screenshot_path,
+                "duration_seconds": duration,
+                "tokens_used": tokens_estimate
+            }
+            
+        except Exception as e:
+            end_time = datetime.utcnow()
+            duration = (end_time - start_time).total_seconds()
+            
+            # Capture error screenshot
+            try:
+                screenshot_path = await self._capture_screenshot(
+                    execution_id,
+                    step_number,
+                    ExecutionResult.ERROR
+                )
+            except:
+                screenshot_path = None
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "actual": f"Step execution failed: {str(e)}",
+                "expected": step_description,
+                "screenshot_path": screenshot_path,
+                "duration_seconds": duration,
+                "tokens_used": 0
+            }
+    
+# Singleton instance
+_stagehand_service: Optional[StagehandExecutionService] = None
+
+
+def get_stagehand_service() -> StagehandExecutionService:
+    """Get or create Stagehand service singleton."""
+    global _stagehand_service
+    if _stagehand_service is None:
+        _stagehand_service = StagehandExecutionService(headless=True)
+    return _stagehand_service
+

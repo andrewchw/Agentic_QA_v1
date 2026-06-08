@@ -1,0 +1,29 @@
+from sqlalchemy import Boolean, Column, Integer, String, DateTime
+from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
+from app.db.base import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="user")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    test_cases = relationship("TestCase", back_populates="user", cascade="all, delete-orphan")
+    kb_documents = relationship("KBDocument", back_populates="user", cascade="all, delete-orphan")
+    test_executions = relationship("TestExecution", back_populates="user", cascade="all, delete-orphan")
+    settings = relationship("UserSetting", back_populates="user", cascade="all, delete-orphan", uselist=False)
+    execution_settings = relationship("ExecutionSettings", back_populates="user", cascade="all, delete-orphan", uselist=False)
+    browser_profiles = relationship("BrowserProfile", back_populates="user", cascade="all, delete-orphan")
+    email_credentials = relationship("EmailCredential", back_populates="user", cascade="all, delete-orphan")
+    step_library_modules = relationship("StepLibraryModule", back_populates="user", cascade="all, delete-orphan")
+
+
