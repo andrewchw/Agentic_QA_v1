@@ -17,13 +17,23 @@ Development (from backend/ folder):
 Production (add to process manager alongside run_server.py / uvicorn):
     python mcp_server.py
 
-Hermes profile config  (~/.hermes/profiles/qa-test-gen/mcp_servers.yaml):
-    servers:
-      - name: ai-web-test
-        transport: http
-        url: http://<NODE2_IP>:8001/mcp
+Hermes profile config  (~/.hermes/profiles/<profile>/config.yaml):
+    mcp_servers:
+      ai-web-test:
+        url: "http://<NODE2_IP>:8001/mcp"
         headers:
           Authorization: "Bearer ${AWT_MCP_SECRET}"
+        timeout: 180
+        connect_timeout: 30
+
+    Profiles that need this MCP server:
+      - qa-manager    (health_check, list_test_cases)
+      - qa-test-gen   (crawl_and_save_test, get_workflow_status, get_workflow_results, + all)
+      - qa-dispatcher (health_check, execute_test, get_execution_status, list_executions,
+                       get_execution_stats) — configure both node2 and node3 entries
+    Profiles that do NOT need it:
+      - qa-requirements  (calls ReqIQ directly via curl in terminal tool)
+      - qa-reporter      (downloads results via terminal/curl from Garage S3)
 
 Tools exposed
 -------------
@@ -49,6 +59,7 @@ from typing import Any, Optional
 import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -182,6 +193,14 @@ async def _call_v2(
 mcp = FastMCP(
     "ai-web-test",
     stateless_http=True,
+    # Use plain JSON responses instead of SSE streams so clients only need
+    # Accept: application/json (not text/event-stream).  Hermes Agent sends
+    # application/json only, causing 406 with the default SSE mode.
+    json_response=True,
+    # Disable DNS-rebinding protection so remote LAN clients (e.g. Hermes Agent
+    # on a different machine) can connect using the server's IP as the Host header.
+    # Bearer-token auth still protects the endpoint.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "Tools for driving the AI Web Test automation platform. "
         "Use crawl_and_save_test to generate a new test case via browser crawl, "
@@ -480,6 +499,44 @@ async def health_check() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Accept-header normaliser — FastMCP validates Accept strictly (no wildcard)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Accept-header normaliser — FastMCP validates Accept strictly (no wildcard)
+# ---------------------------------------------------------------------------
+
+class AcceptNormalizerMiddleware:
+    """Ensure every MCP request carries Accept: application/json.
+
+    Hermes Agent (and other MCP clients) may send Accept: */* or omit it.
+    FastMCP's strict prefix check rejects those with 406.  This raw ASGI
+    middleware rewrites the Accept header in the ASGI scope before FastMCP
+    sees the request, so any MCP client works regardless of what it sends.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            hdrs = {k: v for k, v in scope["headers"]}
+            accept = hdrs.get(b"accept", b"").decode()
+            if not any(
+                t.strip().startswith("application/json")
+                for t in accept.split(",")
+            ):
+                patched = (
+                    "application/json, text/event-stream"
+                    if not accept
+                    else f"application/json, text/event-stream, {accept}"
+                )
+                hdrs[b"accept"] = patched.encode()
+                scope = {**scope, "headers": list(hdrs.items())}
+        await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
 # Security middleware — validate Bearer token on every request
 # ---------------------------------------------------------------------------
 
@@ -513,6 +570,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 if __name__ == "__main__":
     app = mcp.streamable_http_app()
     app.add_middleware(BearerAuthMiddleware)
+    # Wrap with raw ASGI normaliser so clients sending Accept: */* or no
+    # Accept header (e.g. Hermes Agent) are accepted instead of getting 406.
+    app = AcceptNormalizerMiddleware(app)
 
     logger.info("Starting AI Web Test MCP server on port %d", MCP_PORT)
     logger.info("AWT base URL : %s", AWT_BASE)

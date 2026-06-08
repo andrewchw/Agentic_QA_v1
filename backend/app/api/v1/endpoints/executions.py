@@ -17,7 +17,8 @@ from app.schemas.test_execution import (
     TestExecutionDetailResponse,
     TestExecutionListItem,
     TestExecutionListResponse,
-    ExecutionStatistics
+    ExecutionStatistics,
+    LoginCredentials,
 )
 from app.crud import test_case as crud_tests
 from app.crud import test_execution as crud_executions
@@ -230,7 +231,14 @@ async def run_test_with_playwright(
             profile_id=request.browser_profile_id,
             user_id=current_user.id
         )
-    
+
+    # Sprint 10.14: extract ephemeral login_credentials — NEVER stored in DB/trigger_details
+    login_credentials = (
+        request.login_credentials.model_dump()
+        if request.login_credentials
+        else None
+    )
+
     # Set queued timestamp and priority
     execution.queued_at = datetime.utcnow()
     execution.priority = getattr(request, 'priority', 5)  # Default: medium priority
@@ -245,7 +253,8 @@ async def run_test_with_playwright(
         test_case_id=test_case_id,
         user_id=current_user.id,
         priority=execution.priority,
-        http_credentials=http_credentials
+        http_credentials=http_credentials,
+        login_credentials=login_credentials,
     )
     
     # Update queue position in database
@@ -343,6 +352,7 @@ def list_all_executions(
     result_filter: Optional[ExecutionResult] = Query(None, alias="result", description="Filter by result"),
     browser: Optional[str] = Query(None, description="Filter by browser"),
     environment: Optional[str] = Query(None, description="Filter by environment"),
+    triggered_by: Optional[str] = Query(None, description="Filter by trigger source (manual, scheduled, ci_cd, webhook)"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum records to return"),
     current_user: User = Depends(deps.get_current_user),
@@ -377,6 +387,7 @@ def list_all_executions(
         result=result_filter,
         browser=browser,
         environment=environment,
+        triggered_by=triggered_by,
         skip=skip,
         limit=limit
     )
@@ -388,7 +399,8 @@ def list_all_executions(
         status=status_filter,
         result=result_filter,
         browser=browser,
-        environment=environment
+        environment=environment,
+        triggered_by=triggered_by,
     )
     
     items = [TestExecutionListItem.model_validate(exec) for exec in executions]

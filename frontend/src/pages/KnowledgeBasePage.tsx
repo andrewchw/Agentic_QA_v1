@@ -25,10 +25,12 @@ import requirementsService from '../services/requirementsService';
 import type {
   ReqIQProject,
   ReqIQRequirement,
+  ReqIQRevision,
   ReqIQSource,
   LatestIqResult,
   ReadinessResult,
   WikiResult,
+  WikiUpdateResult,
   RagQueryResult,
   SuggestedTest,
   CapabilityItem,
@@ -133,6 +135,10 @@ export const KnowledgeBasePage: React.FC = () => {
   const [wikiLoading, setWikiLoading] = useState(false);
   const [compilingWiki, setCompilingWiki] = useState(false);
   const [wikiError, setWikiError] = useState<string | null>(null);
+  const [wikiEditing, setWikiEditing] = useState(false);
+  const [wikiEditText, setWikiEditText] = useState('');
+  const [savingWiki, setSavingWiki] = useState(false);
+  const [wikiIndexInRag, setWikiIndexInRag] = useState(false);
 
   // -- rag ------------------------------------------------------------------
   const [ragQuery, setRagQuery] = useState('');
@@ -144,6 +150,7 @@ export const KnowledgeBasePage: React.FC = () => {
   const [requirements, setRequirements] = useState<ReqIQRequirement[]>([]);
   const [reqLoading, setReqLoading] = useState(false);
   const [iqData, setIqData] = useState<Record<string, LatestIqResult>>({});
+  const [iqBreakdown, setIqBreakdown] = useState<Record<string, ReqIQRevision['iqSnapshot']>>({});
   const [showNewReq, setShowNewReq] = useState(false);
   const [newReqTitle, setNewReqTitle] = useState('');
   const [newReqBody, setNewReqBody] = useState('');
@@ -207,6 +214,10 @@ export const KnowledgeBasePage: React.FC = () => {
   const [feedbackTotal, setFeedbackTotal] = useState(0);
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const [clearingFeedback, setClearingFeedback] = useState(false);
+  const [editingFeedbackId, setEditingFeedbackId] = useState<string | null>(null);
+  const [editingReason, setEditingReason] = useState('');
+  const [editingTags, setEditingTags] = useState('');
+  const [savingFeedback, setSavingFeedback] = useState(false);
 
   // -- coverage + export (Inc 3) --------------------------------------------
   const [coverageMatrix, setCoverageMatrix] = useState<CoverageMatrix | null>(null);
@@ -383,11 +394,17 @@ export const KnowledgeBasePage: React.FC = () => {
   // -- wiki (Test context) --------------------------------------------------
   async function handleCompileWiki() {
     if (!projectId) return;
+    if (wiki?.compileStatus === 'edited') {
+      if (!window.confirm(
+        'Refresh from ReqIQ will overwrite your manual edits with a freshly compiled version.\n\nContinue?',
+      )) return;
+    }
     setCompilingWiki(true);
     setWikiError(null);
     try {
       const result = await requirementsService.compileWiki(projectId);
       setWiki(result);
+      setWikiEditing(false);
     } catch (err: unknown) {
       const data = (err as { response?: { data?: unknown } })?.response?.data;
       const msg = typeof data === 'object' && data !== null && 'detail' in data
@@ -396,6 +413,32 @@ export const KnowledgeBasePage: React.FC = () => {
       setWikiError(`Compile failed: ${msg}`);
     } finally {
       setCompilingWiki(false);
+    }
+  }
+
+  async function handleSaveWiki() {
+    if (!projectId || !wikiEditText.trim()) return;
+    setSavingWiki(true);
+    setWikiError(null);
+    try {
+      const result: WikiUpdateResult = await requirementsService.patchWiki(
+        projectId,
+        wikiEditText,
+        wikiIndexInRag,
+      );
+      setWiki(result);
+      setWikiEditing(false);
+      setWikiIndexInRag(false);
+      showToast('Test context saved.' + (wikiIndexInRag ? ' RAG index updated.' : ''));
+    } catch (err: unknown) {
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      const msg =
+        typeof data === 'object' && data !== null && 'detail' in data
+          ? JSON.stringify((data as { detail: unknown }).detail)
+          : String(err);
+      setWikiError(`Save failed: ${msg}`);
+    } finally {
+      setSavingWiki(false);
     }
   }
 
@@ -654,6 +697,31 @@ export const KnowledgeBasePage: React.FC = () => {
     }
   }
 
+  function handleStartEditFeedback(fb: WikiSuggestFeedbackItem) {
+    setEditingFeedbackId(fb.id);
+    setEditingReason(fb.reason ?? '');
+    setEditingTags((fb.reasonTags ?? []).join(', '));
+  }
+
+  async function handleSaveFeedbackEdit(feedbackId: string) {
+    if (!projectId) return;
+    setSavingFeedback(true);
+    try {
+      const tags = editingTags.split(',').map(t => t.trim()).filter(Boolean);
+      const updated = await requirementsService.patchWikiSuggestFeedback(projectId, feedbackId, {
+        reason: editingReason || undefined,
+        reasonTags: tags.length > 0 ? tags : undefined,
+      });
+      setFeedbackHistory(prev => prev.map(fb => fb.id === feedbackId ? { ...fb, ...updated } : fb));
+      setEditingFeedbackId(null);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      alert(`Save failed: ${msg ?? String(err)}`);
+    } finally {
+      setSavingFeedback(false);
+    }
+  }
+
   async function handleDeleteRequirement(req: ReqIQRequirement) {
     if (!projectId) return;
     if (!confirm(`Delete requirement "${req.title}"? This cannot be undone.`)) return;
@@ -736,10 +804,15 @@ export const KnowledgeBasePage: React.FC = () => {
     setRunningIqFor(req.id);
     try {
       const revIdx = iqData[req.id]?.latestRevisionIndex ?? 0;
+      let revision: ReqIQRevision;
       if (type === 'stub') {
-        await requirementsService.runStubIq(projectId, req.id, revIdx);
+        revision = await requirementsService.runStubIq(projectId, req.id, revIdx);
       } else {
-        await requirementsService.runLlmIq(projectId, req.id, revIdx);
+        revision = await requirementsService.runLlmIq(projectId, req.id, revIdx);
+      }
+      // store breakdown (scores + rationale) from the revision response
+      if (revision.iqSnapshot) {
+        setIqBreakdown(prev => ({ ...prev, [req.id]: revision.iqSnapshot }));
       }
       // refresh IQ score
       const updated = await requirementsService.getLatestIq(projectId, req.id);
@@ -1007,13 +1080,41 @@ export const KnowledgeBasePage: React.FC = () => {
             <SectionCard
               title="Test context"
               actions={
-                <SmallBtn
-                  onClick={handleCompileWiki}
-                  disabled={compilingWiki || !projectId}
-                  variant="default"
-                >
-                  {compilingWiki ? 'Refreshing…' : 'Refresh'}
-                </SmallBtn>
+                <div className="flex items-center gap-2">
+                  {/* compileStatus chip */}
+                  {wiki && (
+                    <span className={`text-xs font-medium px-2 py-0.5 rounded-full border ${
+                      wiki.compileStatus === 'ok'
+                        ? 'bg-green-50 text-green-700 border-green-200'
+                        : wiki.compileStatus === 'edited'
+                        ? 'bg-blue-50 text-blue-700 border-blue-200'
+                        : wiki.compileStatus === 'no_sources'
+                        ? 'bg-yellow-50 text-yellow-700 border-yellow-200'
+                        : 'bg-red-50 text-red-700 border-red-200'
+                    }`}>
+                      {wiki.compileStatus === 'ok' ? 'Ready'
+                        : wiki.compileStatus === 'edited' ? 'Edited'
+                        : wiki.compileStatus === 'no_sources' ? 'No sources'
+                        : 'Failed'}
+                    </span>
+                  )}
+                  {!wikiEditing && wiki && (
+                    <SmallBtn
+                      onClick={() => { setWikiEditText(wiki.markdown ?? ''); setWikiEditing(true); setWikiError(null); }}
+                      disabled={!projectId}
+                      variant="primary"
+                    >
+                      Edit
+                    </SmallBtn>
+                  )}
+                  <SmallBtn
+                    onClick={handleCompileWiki}
+                    disabled={compilingWiki || !projectId}
+                    variant="default"
+                  >
+                    {compilingWiki ? 'Refreshing…' : 'Refresh from ReqIQ'}
+                  </SmallBtn>
+                </div>
               }
             >
               {wikiError && <p className="text-sm text-red-600">{wikiError}</p>}
@@ -1021,23 +1122,67 @@ export const KnowledgeBasePage: React.FC = () => {
                 <p className="text-sm text-gray-400">Loading Test context…</p>
               ) : !wiki ? (
                 <p className="text-sm text-gray-400">No Test context yet — upload documents and wait for indexing.</p>
+              ) : wikiEditing ? (
+                <div className="space-y-3">
+                  <textarea
+                    value={wikiEditText}
+                    onChange={e => setWikiEditText(e.target.value)}
+                    rows={12}
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+                    disabled={savingWiki}
+                    placeholder="Enter wiki markdown…"
+                  />
+                  <label className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={wikiIndexInRag}
+                      onChange={e => setWikiIndexInRag(e.target.checked)}
+                      disabled={savingWiki}
+                      className="rounded"
+                    />
+                    Also index in RAG
+                    <span className="text-gray-400">(updates search index; takes longer)</span>
+                  </label>
+                  {savingWiki && wikiIndexInRag && (
+                    <p className="text-xs text-blue-600">⏳ Indexing in RAG… this may take a moment.</p>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <SmallBtn
+                      onClick={handleSaveWiki}
+                      disabled={savingWiki || !wikiEditText.trim()}
+                      variant="primary"
+                    >
+                      {savingWiki ? 'Saving…' : 'Save'}
+                    </SmallBtn>
+                    <SmallBtn
+                      onClick={() => { setWikiEditing(false); setWikiIndexInRag(false); setWikiError(null); }}
+                      disabled={savingWiki}
+                      variant="default"
+                    >
+                      Cancel
+                    </SmallBtn>
+                  </div>
+                </div>
               ) : (
                 <div className="space-y-2">
-                  {/* wikiSource banner */}
+                  {/* wikiStale banner */}
                   {wiki.wikiStale && (
                     <div className="flex items-center gap-2 rounded-md bg-orange-50 border border-orange-200 px-3 py-2 text-xs text-orange-700">
-                      ⚠ Documents or index changed — Test context may be outdated. Click Refresh to recompile.
+                      ⚠ Documents or index changed — Test context may be outdated. Click “Refresh from ReqIQ” to recompile.
                     </div>
                   )}
-                  {/* compile status chip */}
-                  {wiki.compileStatus !== 'ok' && (
+                  {/* compile status messaging for non-ok states */}
+                  {wiki.compileStatus === 'no_sources' && (
+                    <div className="flex items-center gap-2 rounded-md bg-yellow-50 border border-yellow-200 px-3 py-2 text-xs text-yellow-700">
+                      No documents indexed yet. Upload a file and wait for reindex.
+                    </div>
+                  )}
+                  {wiki.compileStatus === 'failed' && (
                     <div className="flex items-center gap-2 rounded-md bg-red-50 border border-red-200 px-3 py-2 text-xs text-red-700">
-                      {wiki.compileStatus === 'no_sources'
-                        ? 'No documents indexed yet. Upload a file and wait for reindex.'
-                        : 'Test context failed to compile. Try refreshing.'}
+                      Test context failed to compile. Try “Refresh from ReqIQ”.
                     </div>
                   )}
-                  {wiki.compileStatus === 'ok' && wiki.markdown && (
+                  {(wiki.compileStatus === 'ok' || wiki.compileStatus === 'edited') && wiki.markdown && (
                     <div className="rounded-md bg-gray-50 border border-gray-200 p-3 text-xs text-gray-700 whitespace-pre-wrap max-h-64 overflow-y-auto font-mono leading-relaxed">
                       {wiki.markdown}
                     </div>
@@ -1263,7 +1408,7 @@ export const KnowledgeBasePage: React.FC = () => {
               {showReviewHistory && (
                 <div className="rounded-md border border-gray-200 bg-gray-50 p-3 space-y-2">
                   <div className="flex items-center justify-between">
-                    <p className="text-xs font-semibold text-gray-600">Feedback history ({feedbackTotal})</p>
+                    <p className="text-xs font-semibold text-gray-600">Rejected feedback ({feedbackHistory.filter(fb => fb.decision === 'reject').length} of {feedbackTotal} total)</p>
                     <button
                       onClick={handleLoadFeedbackHistory}
                       disabled={loadingFeedback}
@@ -1276,23 +1421,71 @@ export const KnowledgeBasePage: React.FC = () => {
                     <p className="text-xs text-gray-400">{loadingFeedback ? 'Loading…' : 'No feedback history yet.'}</p>
                   ) : (
                     <ul className="divide-y divide-gray-100 max-h-48 overflow-y-auto">
-                      {feedbackHistory.map(fb => (
+                      {feedbackHistory.filter(fb => fb.decision === 'reject').map(fb => (
                         <li key={fb.id} className="py-1.5 flex items-start gap-2">
-                          <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0 ${fb.decision === 'accept' || fb.decision === 'accept_edited' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
-                            {fb.decision === 'accept_edited' ? 'edited' : fb.decision}
+                          <span className="text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0 bg-red-50 text-red-700">
+                            reject
                           </span>
                           <div className="min-w-0 flex-1">
                             {fb.requirementTitle && <p className="text-xs text-gray-700 truncate">{fb.requirementTitle}</p>}
-                            {fb.reason && <p className="text-xs text-gray-500 italic">{fb.reason}</p>}
-                            {fb.reasonTags && fb.reasonTags.length > 0 && (
-                              <div className="flex gap-1 flex-wrap mt-0.5">
-                                {fb.reasonTags.map(t => <span key={t} className="text-xs bg-gray-100 text-gray-600 px-1 rounded">{t}</span>)}
+                            {editingFeedbackId === fb.id ? (
+                              <div className="space-y-1 mt-1">
+                                <input
+                                  autoFocus
+                                  className="w-full border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                  placeholder="Reason…"
+                                  value={editingReason}
+                                  onChange={e => setEditingReason(e.target.value)}
+                                />
+                                <input
+                                  className="w-full border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                  placeholder="Tags (comma-separated)…"
+                                  value={editingTags}
+                                  onChange={e => setEditingTags(e.target.value)}
+                                />
+                                <div className="flex gap-1">
+                                  <button
+                                    onClick={() => handleSaveFeedbackEdit(fb.id)}
+                                    disabled={savingFeedback}
+                                    className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded hover:bg-blue-700 disabled:opacity-50"
+                                  >
+                                    {savingFeedback ? 'Saving…' : 'Save'}
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingFeedbackId(null)}
+                                    className="text-xs text-gray-500 hover:text-gray-700 px-2 py-0.5"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
                               </div>
+                            ) : (
+                              <>
+                                {fb.requirementTitle && <p className="text-xs text-gray-700 truncate font-medium">{fb.requirementTitle}</p>}
+                                {fb.reason
+                                  ? <p className="text-xs text-gray-500 italic">{fb.reason}</p>
+                                  : <p className="text-xs text-gray-400 italic">No reason provided</p>
+                                }
+                                {fb.reasonTags && fb.reasonTags.length > 0 && (
+                                  <div className="flex gap-1 flex-wrap mt-0.5">
+                                    {fb.reasonTags.map(t => <span key={t} className="text-xs bg-gray-100 text-gray-600 px-1 rounded">{t}</span>)}
+                                  </div>
+                                )}
+                                <button
+                                  onClick={() => handleStartEditFeedback(fb)}
+                                  className="text-xs text-blue-500 hover:text-blue-700 mt-0.5"
+                                >
+                                  Edit reason
+                                </button>
+                              </>
                             )}
                           </div>
                           <span className="text-xs text-gray-400 shrink-0">{new Date(fb.createdAt).toLocaleDateString()}</span>
                         </li>
                       ))}
+                      {feedbackHistory.filter(fb => fb.decision === 'reject').length === 0 && (
+                        <p className="text-xs text-gray-400 py-1">No rejected entries.</p>
+                      )}
                     </ul>
                   )}
                 </div>
@@ -1657,6 +1850,38 @@ export const KnowledgeBasePage: React.FC = () => {
                                 )}
                               </div>
                             </div>
+
+                            {/* IQ breakdown panel — shown after running Stub IQ / LLM IQ */}
+                            {iqBreakdown[req.id] && (() => {
+                              const snap = iqBreakdown[req.id]!;
+                              const scoreEntries = snap.scores ? Object.entries(snap.scores) : [];
+                              return (
+                                <div className="rounded-md bg-gray-50 border border-gray-200 px-3 py-2 space-y-1.5">
+                                  {scoreEntries.length > 0 && (
+                                    <div className="flex flex-wrap gap-x-4 gap-y-1">
+                                      {scoreEntries.map(([dim, val]) => {
+                                        const colour = val >= 80 ? 'text-green-700' : val >= 60 ? 'text-yellow-600' : 'text-red-600';
+                                        return (
+                                          <span key={dim} className="text-xs">
+                                            <span className="text-gray-500 capitalize">{dim.replace(/_/g, ' ')}: </span>
+                                            <span className={`font-semibold ${colour}`}>{Math.round(val)}</span>
+                                          </span>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                  {snap.rationale && (
+                                    <p className="text-xs text-gray-600 leading-relaxed">{snap.rationale}</p>
+                                  )}
+                                  {!snap.rationale && scoreEntries.length === 0 && (
+                                    <p className="text-xs text-gray-400 italic">No breakdown available (Stub IQ — rule-based, no rationale)</p>
+                                  )}
+                                  {!snap.rationale && scoreEntries.length > 0 && (
+                                    <p className="text-xs text-gray-400 italic">Stub IQ — deterministic scores, no LLM rationale</p>
+                                  )}
+                                </div>
+                              );
+                            })()}
 
                             {/* Wiki-suggest review actions */}
                             {req.isWikiSuggest && req.state === 'DRAFT' && (

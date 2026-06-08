@@ -34,6 +34,13 @@ export interface TestExecutionStep {
   screenshot_before?: string;
   screenshot_after?: string;
   retry_count: number;
+  /** Sprint 10.17: AI vision verdict for verify_screenshot steps. */
+  ai_verification_result?: {
+    verdict: 'PASS' | 'FAIL';
+    reason: string;
+    provider: string;
+    model: string | null;
+  } | null;
   created_at: string;
 }
 
@@ -158,6 +165,11 @@ export interface ExecutionStartRequest {
   resume_from_execution_id?: number;
   /** 1-based step index to resume from (minimum 2) */
   start_from_step?: number;
+  /** Sprint 10.14: Ephemeral CRM login credentials — never persisted */
+  login_credentials?: {
+    username: string;
+    password: string;
+  };
 }
 
 export interface ExecutionStartResponse {

@@ -67,6 +67,13 @@ export interface ReqIQRequirement {
   updatedAt: string;
 }
 
+export interface ReqIQIqSnapshot {
+  compositeScore?: number;
+  scores?: Record<string, number>;
+  rationale?: string;
+  algorithm?: string;
+}
+
 export interface ReqIQRevision {
   id: string;
   requirementId: string;
@@ -74,6 +81,7 @@ export interface ReqIQRevision {
   title: string;
   body: string;
   compositeScore?: number;
+  iqSnapshot?: ReqIQIqSnapshot;
   createdAt: string;
 }
 
@@ -153,12 +161,21 @@ export interface ReadinessResult {
 export interface WikiResult {
   projectId: string;
   markdown: string;
-  compileStatus: 'ok' | 'no_sources' | 'failed';
+  compileStatus: 'ok' | 'edited' | 'no_sources' | 'failed';
   wikiStale: boolean;
   compiledAt?: string;
   citationCount?: number;
   embeddingIndexVersion?: number;
   featureHint?: string | null;
+}
+
+export interface WikiUpdateResult extends WikiResult {
+  /** Present when indexInRag was true — summary of RAG upsert and reindex */
+  ragSync?: {
+    sourceId: string;
+    chunkCount: number;
+    reindex: Record<string, unknown>;
+  };
 }
 
 export interface SuggestTestsResult {
@@ -262,15 +279,15 @@ const requirementsService = {
     return res.data;
   },
 
-  async runStubIq(projectId: string, requirementId: string, revisionIndex: number): Promise<unknown> {
-    const res = await api.post(
+  async runStubIq(projectId: string, requirementId: string, revisionIndex: number): Promise<ReqIQRevision> {
+    const res = await api.post<ReqIQRevision>(
       `${BASE}/${projectId}/requirements/${requirementId}/revisions/${revisionIndex}/stub-iq`,
     );
     return res.data;
   },
 
-  async runLlmIq(projectId: string, requirementId: string, revisionIndex: number): Promise<unknown> {
-    const res = await api.post(
+  async runLlmIq(projectId: string, requirementId: string, revisionIndex: number): Promise<ReqIQRevision> {
+    const res = await api.post<ReqIQRevision>(
       `${BASE}/${projectId}/requirements/${requirementId}/revisions/${revisionIndex}/llm-iq`,
     );
     return res.data;
@@ -400,6 +417,18 @@ const requirementsService = {
     return res.data;
   },
 
+  async patchWiki(
+    projectId: string,
+    markdown: string,
+    indexInRag = false,
+  ): Promise<WikiUpdateResult> {
+    const res = await api.patch<WikiUpdateResult>(
+      `${BASE}/projects/${projectId}/wiki`,
+      { markdown, indexInRag },
+    );
+    return res.data;
+  },
+
   async compileWiki(projectId: string, feature = ''): Promise<WikiResult> {
     const params: Record<string, string> = {};
     if (feature) params.feature = feature;
@@ -441,6 +470,11 @@ const requirementsService = {
 
   async listWikiSuggestFeedback(projectId: string, opts?: { limit?: number; offset?: number }): Promise<{ items: WikiSuggestFeedbackItem[]; total: number }> {
     const res = await api.get(`${BASE}/${projectId}/wiki-suggest-feedback`, { params: opts });
+    return res.data;
+  },
+
+  async patchWikiSuggestFeedback(projectId: string, feedbackId: string, fields: { reason?: string; reasonTags?: string[] }): Promise<WikiSuggestFeedbackItem> {
+    const res = await api.patch<WikiSuggestFeedbackItem>(`${BASE}/${projectId}/wiki-suggest-feedback/${feedbackId}`, fields);
     return res.data;
   },
 

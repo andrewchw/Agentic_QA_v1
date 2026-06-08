@@ -88,7 +88,11 @@ class Tier3StagehandExecutor:
                 # Use goto instead of act for navigation
                 url = value or instruction
                 await self.stagehand.page.goto(url, timeout=self.timeout_ms, wait_until="networkidle")
-                
+
+            elif action == "verify_screenshot":
+                # Sprint 10.17: vision not available → semantic text fallback via extract()
+                return await self._execute_verify_screenshot_fallback(step, start_time)
+
             elif action in ["fill", "type"] and value:
                 # Combine action with value for better instruction
                 full_instruction = f"{instruction} with value '{value}'"
@@ -370,6 +374,60 @@ class Tier3StagehandExecutor:
         await self.stagehand.page.mouse.up()
         
         logger.info(f"[Tier 3] ✅ Signature drawn successfully via fallback")
+
+    # ------------------------------------------------------------------
+    # Sprint 10.17: verify_screenshot semantic fallback
+    # ------------------------------------------------------------------
+
+    async def _execute_verify_screenshot_fallback(
+        self,
+        step: Dict[str, Any],
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """Fallback for verify_screenshot when vision AI is unavailable.
+
+        DOM text search CANNOT reliably verify that content is visually shown
+        on screen — navigation tabs, hidden sections, or off-screen elements
+        all contain text that would produce false PASSes.
+
+        Therefore this fallback always returns FAIL with an explicit message
+        telling the user they need a vision-capable provider (OpenRouter with
+        a vision model, Azure OpenAI, or Google Gemini).
+        """
+        import json as _json
+
+        instruction = step.get("instruction", "")
+        expected_items: list = step.get("expected_items") or []
+
+        logger.warning(
+            "[Tier 3] ⚠️  verify_screenshot requires vision AI — "
+            "current provider does not support vision.  Returning FAIL.  "
+            "Configure a vision-capable provider (OpenRouter/Azure/Google). "
+            "Instruction: %s",
+            instruction,
+        )
+
+        reason = (
+            "Vision AI unavailable: verify_screenshot requires a vision-capable provider "
+            "(OpenRouter with a vision model, Azure OpenAI, or Google Gemini). "
+            "DOM text search cannot distinguish whether content is actually visible on screen."
+        )
+        verdict_dict = {
+            "verdict": "FAIL",
+            "reason": reason,
+            "provider": "none (vision_required)",
+            "model": None,
+        }
+        execution_time_ms = (time.time() - start_time) * 1000
+
+        return {
+            "success": False,
+            "tier": 3,
+            "execution_time_ms": execution_time_ms,
+            "error": reason,
+            "error_type": "vision_ai_unavailable",
+            "ai_verification_result": _json.dumps(verdict_dict),
+        }
 
 
 # Import asyncio for timeout handling

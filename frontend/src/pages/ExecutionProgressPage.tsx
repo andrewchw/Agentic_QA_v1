@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Layout } from '../components/layout/Layout';
 import { Card } from '../components/common/Card';
@@ -14,6 +14,7 @@ import { ReRunFromStepButton } from '../components/execution/ReRunFromStepButton
 import executionService from '../services/executionService';
 import debugService from '../services/debugService';
 import feedbackService from '../services/feedbackService';
+import settingsService from '../services/settingsService';
 import type { TestExecutionDetail, ExecutionStatus, ExecutionResult, ExecutionFeedback } from '../types/execution';
 import type { DebugMode } from '../types/debug';
 
@@ -389,6 +390,105 @@ function ExecutionStatusBadge({ status, result }: ExecutionStatusBadgeProps) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Sprint 10.17: AI Screenshot Verification verdict badge
+// ---------------------------------------------------------------------------
+
+interface AiVerificationBadgeProps {
+  verdict: {
+    verdict: 'PASS' | 'FAIL';
+    reason: string;
+    provider: string;
+    model: string | null;
+  } | null | undefined;
+}
+
+function AiVerificationBadge({ verdict }: AiVerificationBadgeProps) {
+  const [expanded, setExpanded] = React.useState(false);
+
+  if (!verdict) return null;
+
+  const isPassed = verdict.verdict === 'PASS';
+  const badgeColor = isPassed
+    ? 'bg-green-100 border-green-300 text-green-800'
+    : 'bg-red-100 border-red-300 text-red-800';
+  const icon = isPassed ? '✅' : '❌';
+  const label = isPassed ? 'AI PASS' : 'AI FAIL';
+
+  return (
+    <div className="mt-2">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        data-testid="ai-verification-badge"
+        className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded border ${badgeColor} cursor-pointer`}
+        title="Click to expand AI verification details"
+      >
+        {icon} {label}
+        <span className="ml-1 text-xs opacity-70">{expanded ? '▲' : '▼'}</span>
+      </button>
+      {expanded && (
+        <div
+          data-testid="ai-verification-reason"
+          className={`mt-1 p-2 text-xs rounded border ${badgeColor}`}
+        >
+          <div className="font-medium mb-1">AI Vision Verdict</div>
+          <div>{verdict.reason}</div>
+          {verdict.provider && (
+            <div className="mt-1 opacity-70">
+              Provider: {verdict.provider}{verdict.model ? ` · ${verdict.model}` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 10.16: Per-step XPath cache clear button
+// ---------------------------------------------------------------------------
+
+function ClearStepCacheButton({ stepDescription }: { stepDescription: string }) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [cleared, setCleared] = useState(0);
+
+  const handleClear = async () => {
+    if (!confirm(
+      `Clear the XPath cache for this step?\n\n"${stepDescription}"\n\nThe step will re-learn its XPath on the next run.`
+    )) return;
+    setStatus('loading');
+    try {
+      const list = await settingsService.getXPathCacheEntries(stepDescription);
+      await Promise.all(list.entries.map((e: { id: number }) => settingsService.deleteXPathCacheEntry(e.id)));
+      setCleared(list.entries.length);
+      setStatus('done');
+      setTimeout(() => setStatus('idle'), 4000);
+    } catch {
+      setStatus('error');
+      setTimeout(() => setStatus('idle'), 4000);
+    }
+  };
+
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <button
+        onClick={handleClear}
+        disabled={status === 'loading'}
+        title="Force this step to re-learn its XPath on the next run"
+        className="flex items-center gap-1 px-2 py-1 text-xs rounded border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-50"
+      >
+        {status === 'loading' ? '⏳' : '🗑'} Clear XPath Cache
+      </button>
+      {status === 'done' && (
+        <span className="text-xs text-green-700">
+          {cleared === 0 ? 'No cache found for this step.' : `Cleared ${cleared} cache ${cleared === 1 ? 'entry' : 'entries'}.`}
+        </span>
+      )}
+      {status === 'error' && <span className="text-xs text-red-600">Failed to clear cache.</span>}
+    </div>
+  );
+}
+
 interface StepCardProps {
   step: TestExecutionDetail['steps'][0];
   executionId: number;
@@ -451,6 +551,9 @@ function StepCard({ step, executionId, testCaseId, baseUrl, browser, environment
             </div>
           )}
 
+          {/* Sprint 10.17: AI Screenshot Verification verdict badge */}
+          <AiVerificationBadge verdict={step.ai_verification_result} />
+
           {/* Sprint 10.12: AI Root Cause Analysis panel for all_tiers_exhausted failures */}
           <RootCauseAnalysisPanel rootCauseAnalysis={rootCauseAnalysis} />
 
@@ -464,6 +567,9 @@ function StepCard({ step, executionId, testCaseId, baseUrl, browser, environment
             browser={browser}
             environment={environment}
           />
+
+          {/* Sprint 10.16: Per-step XPath cache clear */}
+          <ClearStepCacheButton stepDescription={step.step_description} />
 
           {step.duration_seconds !== undefined && (
             <div className="mt-2 text-sm text-gray-600">

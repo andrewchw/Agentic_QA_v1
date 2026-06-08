@@ -51,7 +51,17 @@
 - `frontend/src/components/execution/RootCauseAnalysisPanel.tsx`
 - `frontend/src/components/__tests__/ExecutionProgressPage.rca.test.tsx`
 - `frontend/src/pages/ExecutionProgressPage.tsx`
+- `frontend/src/pages/SettingsPage.tsx`
+- `frontend/src/components/XPathCachePanel.tsx`
+- `frontend/src/components/__tests__/XPathCachePanel.test.tsx`
+- `frontend/src/services/settingsService.ts`
+- `backend/app/api/v1/endpoints/settings.py`
+- `backend/tests/unit/test_xpath_cache_api.py`
 - `frontend/src/services/feedbackService.ts`
+- `backend/app/services/step_progress_guard.py` (extended)
+- `backend/app/services/xpath_cache_service.py` (extended)
+- `backend/app/models/execution_settings.py` (extended)
+- `backend/app/schemas/execution_settings.py` (extended)
 
 ---
 
@@ -101,6 +111,7 @@
 42. [ADR-002-42: Step Library @module: Syntax and Resolver Architecture](#adr-002-42-step-library-module-syntax-and-resolver-architecture)
 43. [ADR-002-43: AI-Powered Failure Root Cause Analysis](#adr-002-43-ai-powered-failure-root-cause-analysis)
 44. [ADR-002-44: Re-Run from Failed Step — Session Snapshot Persistence and Resume Architecture](#adr-002-44-re-run-from-failed-step--session-snapshot-persistence-and-resume-architecture)
+45. [ADR-002-45: XPath Cache Management UI and Step-Level Invalidation](#adr-002-45-xpath-cache-management-ui-and-step-level-invalidation)
 
 ---
 
@@ -3405,4 +3416,95 @@ skipped_steps = (start_from_step - 1) if is_resume else 0
 - `frontend/src/components/__tests__/ReRunFromStepButton.test.tsx` — 10 frontend tests: visibility (4), confirmation dialog (4), API integration (2)
 
 **Total: 33 backend + 10 frontend = 43 new tests. 245 total frontend tests pass. No regression.**
+
+---
+
+## ADR-002-45: XPath Cache Management UI and Step-Level Invalidation
+
+**Date:** May 26, 2026 (Sprint 10.16)
+
+### Context
+
+The XPath cache was already effective at reducing repeated `observe()` calls, but operational recovery was too blunt. When a cached XPath became stale or was learned against the wrong element, the only remediation path was a backend Python one-liner that deleted the entire `xpath_cache` table. That forced every cached step to re-learn on the next run, increased LLM cost, and penalized unrelated steps whose cache entries were still correct.
+
+Users needed two new capabilities:
+
+1. **Targeted remediation** — delete a single cached XPath entry, or the entries associated with one execution step, without touching the rest of the cache.
+2. **Safe bulk cleanup** — remove only invalid (`is_valid=False`) entries when the self-healing path has already identified them as bad, instead of wiping all entries.
+
+The requirement applied in two places: the Settings page for global cache management, and the Execution Progress page for step-level remediation immediately after a failed or suspicious step.
+
+### Decision
+
+Expose the XPath cache as an explicit management surface in the product UI, backed by narrow REST endpoints, while preserving the existing cache key, validation, and self-healing behaviour in `XPathCacheService`.
+
+#### ADR-002-45-A: Settings API for XPath Cache Introspection and Deletion
+
+Add four Settings endpoints dedicated to cache management:
+
+- `GET /settings/xpath-cache/stats` — aggregate counts and hit metrics
+- `GET /settings/xpath-cache?keyword=` — list entries, filtered by case-insensitive instruction or URL substring
+- `DELETE /settings/xpath-cache/{id}` — delete one concrete cache row by primary key
+- `DELETE /settings/xpath-cache?invalid_only=` — bulk delete either all rows or only invalid rows
+
+The response surface is intentionally read-oriented plus delete-only. It does not add update or manual edit endpoints; regeneration remains the responsibility of normal Tier 2 execution on the next run.
+
+#### ADR-002-45-B: Settings Page Panel for Human-Operated Cache Management
+
+Add `XPathCachePanel` to the Settings page. The panel provides:
+
+- Stats row: total, valid, invalid, total hits
+- 400 ms debounced keyword filter
+- Entries table with per-row delete button
+- `Clear Invalid` button for `is_valid=False` rows only
+- `Clear All` button as the GUI replacement for the old Python one-liner
+
+The panel is read-only until both stats and list responses load successfully. Deletions always require explicit confirmation.
+
+#### ADR-002-45-C: Step-Level Clear Reuses List + Delete Rather Than New Semantics
+
+Add `ClearStepCacheButton` to each `StepCard` on the Execution Progress page.
+
+The step-level action does not introduce a new backend contract such as `DELETE /xpath-cache/by-instruction`. Instead it reuses the existing list-plus-delete API:
+
+1. Query `GET /settings/xpath-cache?keyword=<step.step_description>`
+2. Delete each returned row by `id`
+3. Report how many rows were cleared, including `0` when no cache existed for that step
+
+This keeps the API surface small and preserves the invariant that deletes are always row-level, auditable DB operations.
+
+#### ADR-002-45-D: Preserve Valid Cache Entries by Default
+
+The shipped UX deliberately prefers surgical deletion over global reset:
+
+- Per-row delete removes exactly one cache entry.
+- Step-level clear removes only rows whose instruction matches the current step text.
+- `Clear Invalid` preserves all valid rows.
+- `Clear All` remains available, but is explicit and confirm-gated.
+
+The design assumes that most cache entries are useful and should survive localized failures.
+
+### Consequences
+
+**Positive**
+- Users can clear one broken cache entry without destroying unrelated, still-correct entries.
+- Execution-page remediation is immediate; a user can clear the suspect step directly from the run history without switching to backend tooling.
+- `Clear Invalid` complements the existing self-healing path by exposing already-invalidated rows as a safe bulk cleanup target.
+- No new cache key strategy or write-path semantics were introduced; Tier 2 regeneration stays unchanged.
+
+**Negative**
+- Step-level clear relies on keyword substring matching against `step_description`. If multiple cache rows share near-identical instruction text, the action may clear more than one row for that step.
+- The new Settings surface increases operational power for end users, so destructive actions remain confirm-gated and intentionally delete-only.
+- The API exposes cache internals (instruction, page URL, hit count, validity) to the authenticated UI, which is acceptable for this internal test-management product but broadens the settings payload.
+
+**Alternatives Considered**
+- **Keep backend-only remediation**: Rejected. Requiring developers or operators to run ad hoc Python commands for routine cache cleanup is too slow and too error-prone.
+- **Add a dedicated delete-by-instruction endpoint**: Rejected. The existing list-plus-delete contract was sufficient and simpler to reason about than a second deletion semantic based on fuzzy instruction matching.
+- **Always clear the full cache after suspicious runs**: Rejected. It solves correctness by discarding too much good data and increases LLM cost on future runs.
+
+### Tests
+
+- `backend/tests/unit/test_xpath_cache_api.py` (new) — 16 backend tests covering stats response, list response, keyword filter, single-row delete, bulk delete, invalid-only delete, and ORM schema compatibility
+- `frontend/src/components/__tests__/XPathCachePanel.test.tsx` (new) — 17 frontend tests covering loading, stats row, keyword filter, per-row delete, clear-invalid, clear-all, empty state, and error state
+- Manual verification via the Settings page and Execution Progress page confirmed that targeted cache deletion leaves unrelated valid rows intact and that zero-match step clears surface a non-error message instead of failing
 

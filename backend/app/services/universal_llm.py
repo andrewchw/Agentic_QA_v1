@@ -2,10 +2,26 @@
 Universal LLM service that supports multiple providers.
 Handles Google Gemini, Cerebras, and OpenRouter.
 """
+import base64
 import httpx
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from app.core.config import settings
+
+# Sprint 10.15: vLLM models that accept chat_template_kwargs: { enable_thinking }
+_THINKING_CAPABLE_VLLM_MODELS: frozenset = frozenset({
+    "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+})
+
+# Sprint 10.17: providers that support multimodal vision requests
+_VISION_CAPABLE_PROVIDERS: frozenset = frozenset({"azure", "openrouter", "google"})
+
+
+class VisionNotSupportedError(Exception):
+    """Raised when the configured provider/model does not support vision (image) input.
+
+    Callers (ScreenshotVerificationService) catch this and escalate to Tier 3.
+    """
 
 
 class UniversalLLMService:
@@ -64,7 +80,8 @@ class UniversalLLMService:
         provider: str = "openrouter",
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        enable_thinking: bool = False,
     ) -> dict:
         """
         Call LLM API for chat completion with provider selection.
@@ -75,6 +92,9 @@ class UniversalLLMService:
             model: Model to use (provider-specific)
             temperature: Sampling temperature (0-2)
             max_tokens: Maximum tokens to generate
+            enable_thinking: Sprint 10.15 — when True and provider is local_vllm
+                and the model supports it, injects chat_template_kwargs into the
+                request payload.  Ignored for all other providers.
             
         Returns:
             Unified API response dict with choices, usage, etc.
@@ -92,10 +112,285 @@ class UniversalLLMService:
         elif provider == "azure":
             return await self._call_azure(messages, model, temperature, max_tokens)
         elif provider == "local_vllm":
-            return await self._call_local_vllm(messages, model, temperature, max_tokens)
+            return await self._call_local_vllm(messages, model, temperature, max_tokens, enable_thinking=enable_thinking)
         else:  # default to openrouter
             return await self._call_openrouter(messages, model, temperature, max_tokens)
-    
+
+    # ------------------------------------------------------------------
+    # Sprint 10.17: Multimodal vision completion
+    # ------------------------------------------------------------------
+
+    async def vision_completion(
+        self,
+        image_bytes: bytes,
+        system_prompt: str,
+        user_text: str,
+        provider: str = "openrouter",
+        model: Optional[str] = None,
+        max_tokens: int = 256,
+    ) -> dict:
+        """Call a vision-capable LLM with an image + text prompt.
+
+        Args:
+            image_bytes: Raw PNG/JPEG screenshot bytes.
+            system_prompt: System instruction (e.g. PASS/FAIL response format).
+            user_text: User message describing the verification task.
+            provider: LLM provider. Must be one of: azure, openrouter, google.
+                      cerebras and local_vllm raise VisionNotSupportedError.
+            model: Optional model override.
+            max_tokens: Maximum tokens in the response.
+
+        Returns:
+            Unified response dict (same structure as chat_completion).
+
+        Raises:
+            VisionNotSupportedError: When provider does not support vision.
+            ValueError: When required API credentials are missing.
+            Exception: On API errors.
+        """
+        provider = provider.lower()
+
+        if provider not in _VISION_CAPABLE_PROVIDERS:
+            raise VisionNotSupportedError(
+                f"Provider '{provider}' does not support vision requests. "
+                "Use azure, openrouter, or google for verify_screenshot steps."
+            )
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        if provider == "google":
+            return await self._call_google_vision(image_b64, system_prompt, user_text, model, max_tokens)
+        elif provider == "azure":
+            return await self._call_azure_vision(image_b64, system_prompt, user_text, model, max_tokens)
+        else:  # openrouter
+            return await self._call_openrouter_vision(image_b64, system_prompt, user_text, model, max_tokens)
+
+    async def _call_openrouter_vision(
+        self,
+        image_b64: str,
+        system_prompt: str,
+        user_text: str,
+        model: Optional[str],
+        max_tokens: int,
+    ) -> dict:
+        """Call OpenRouter with a multimodal (vision) message."""
+        if not self.openrouter_api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY not set. Required for vision requests via OpenRouter."
+            )
+
+        resolved_model = model or self.OPENROUTER_DEFAULT_FALLBACK_MODEL
+
+        messages: List[Dict] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            },
+        ]
+
+        payload = {
+            "model": resolved_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+
+        client = await self._get_http_client()
+        try:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "http://localhost:8000",
+                    "X-Title": "AI Web Test",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.TimeoutException:
+            raise Exception("OpenRouter vision API request timed out (90s)")
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text if e.response else "Unknown error"
+            raise Exception(f"OpenRouter vision API error ({e.response.status_code}): {error_detail}")
+        except httpx.HTTPError as e:
+            raise Exception(f"OpenRouter vision API connection error: {str(e)}")
+
+    async def _call_azure_vision(
+        self,
+        image_b64: str,
+        system_prompt: str,
+        user_text: str,
+        model: Optional[str],
+        max_tokens: int,
+    ) -> dict:
+        """Call Azure OpenAI with a multimodal (vision) message.
+
+        Uses the same endpoint/URL resolution as _call_azure:
+        - Tries v1/chat/completions first (works for gpt-5.x)
+        - Falls back to deployments/<model>/chat/completions
+        - Uses max_completion_tokens for gpt-5.x models (not max_tokens)
+        """
+        resolved_model = model or "ChatGPT-UAT"
+        model_override = self._azure_model_endpoints.get(resolved_model, {})
+        effective_endpoint = model_override.get("endpoint") or self.azure_endpoint
+        effective_api_version = model_override.get("api_version") or self.azure_api_version
+        effective_api_key = model_override.get("api_key") or self.azure_api_key
+
+        if not effective_api_key or not effective_endpoint:
+            raise ValueError(
+                "AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT not set for vision requests."
+            )
+
+        resource_base = (
+            effective_endpoint.split("/openai")[0]
+            if "/openai" in effective_endpoint
+            else effective_endpoint
+        )
+
+        # gpt-5.x requires max_completion_tokens, older models use max_tokens
+        token_limit_field = "max_completion_tokens" if resolved_model.startswith("gpt-5") else "max_tokens"
+
+        messages: List[Dict] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            },
+        ]
+
+        # Candidate 1: v1 endpoint (preferred for gpt-5.x)
+        v1_base = effective_endpoint if "/openai/v1" in effective_endpoint else f"{resource_base}/openai/v1"
+        v1_url = f"{v1_base.rstrip('/')}/chat/completions"
+        v1_payload: Dict = {
+            "model": resolved_model,
+            "messages": messages,
+            token_limit_field: max_tokens,
+            "temperature": 0.1,
+        }
+
+        # Candidate 2: deployments endpoint (classic Azure format)
+        deployment_url = (
+            f"{resource_base}/openai/deployments/{resolved_model}/chat/completions"
+            f"?api-version={effective_api_version}"
+        )
+        deployment_payload: Dict = {
+            "messages": messages,
+            token_limit_field: max_tokens,
+            "temperature": 0.1,
+        }
+
+        candidates = [
+            {"url": v1_url, "payload": v1_payload},
+            {"url": deployment_url, "payload": deployment_payload},
+        ]
+
+        client = await self._get_http_client()
+        for index, candidate in enumerate(candidates):
+            try:
+                response = await client.post(
+                    candidate["url"],
+                    headers={"api-key": effective_api_key, "Content-Type": "application/json"},
+                    json=candidate["payload"],
+                )
+                response.raise_for_status()
+                return response.json()
+            except httpx.TimeoutException:
+                raise Exception("Azure vision API request timed out (90s)")
+            except httpx.HTTPStatusError as e:
+                can_retry = (
+                    index < len(candidates) - 1
+                    and e.response is not None
+                    and e.response.status_code == 404
+                )
+                if can_retry:
+                    logger.info(
+                        "[Azure Vision] v1 URL returned 404, retrying with deployment URL"
+                    )
+                    continue
+                error_detail = e.response.text if e.response else "Unknown error"
+                raise Exception(f"Azure vision API error ({e.response.status_code}): {error_detail}")
+            except httpx.HTTPError as e:
+                raise Exception(f"Azure vision API connection error: {str(e)}")
+
+        raise Exception("Azure vision API error: all endpoint strategies failed")
+
+    async def _call_google_vision(
+        self,
+        image_b64: str,
+        system_prompt: str,
+        user_text: str,
+        model: Optional[str],
+        max_tokens: int,
+    ) -> dict:
+        """Call Google Gemini with a multimodal (vision) message."""
+        if not self.google_api_key:
+            raise ValueError("GOOGLE_API_KEY not set for vision requests.")
+
+        resolved_model = model or "gemini-1.5-flash"
+        base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+        # Gemini multimodal: combine system + user text, then inline image
+        combined_text = f"{system_prompt}\n\n{user_text}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": combined_text},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": image_b64,
+                            }
+                        },
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens},
+        }
+
+        client = await self._get_http_client()
+        try:
+            response = await client.post(
+                f"{base_url}/models/{resolved_model}:generateContent?key={self.google_api_key}",
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if "candidates" in data and data["candidates"]:
+                content = data["candidates"][0]["content"]["parts"][0]["text"]
+                return {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    ],
+                    "model": resolved_model,
+                    "usage": {"total_tokens": data.get("usageMetadata", {}).get("totalTokenCount", 0)},
+                }
+            raise Exception("No candidates in Gemini vision response")
+        except httpx.TimeoutException:
+            raise Exception("Google Gemini vision API request timed out (90s)")
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text if e.response else "Unknown error"
+            raise Exception(f"Google Gemini vision API error ({e.response.status_code}): {error_detail}")
+        except httpx.HTTPError as e:
+            raise Exception(f"Google Gemini vision API connection error: {str(e)}")
+
     async def _call_google(
         self,
         messages: List[Dict[str, str]],
@@ -351,12 +646,17 @@ class UniversalLLMService:
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        enable_thinking: bool = False,
     ) -> dict:
         """Call an on-premises vLLM server (OpenAI-compatible /v1/chat/completions).
 
         Sprint 10.13: supports three local models, each at its own endpoint.
         Falls back to DeepSeek-V4-Flash-4bit when no model is specified.
+
+        Sprint 10.15: when enable_thinking=True AND the model is thinking-capable,
+        injects chat_template_kwargs: { enable_thinking: true } into the request body.
+        For non-capable models this flag is silently ignored regardless of the setting.
         """
         if not model:
             model = "DeepSeek-V4-Flash-4bit"
@@ -378,6 +678,10 @@ class UniversalLLMService:
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
+
+        # Sprint 10.15: inject thinking flag only for capable models
+        if enable_thinking and model in _THINKING_CAPABLE_VLLM_MODELS:
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
 
         client = await self._get_http_client()
         try:

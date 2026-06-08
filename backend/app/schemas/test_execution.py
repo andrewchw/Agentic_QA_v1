@@ -1,7 +1,8 @@
 """Pydantic schemas for test execution."""
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from datetime import datetime
+import json
 from app.models.test_execution import ExecutionStatus, ExecutionResult
 
 
@@ -46,8 +47,25 @@ class TestExecutionStepResponse(TestExecutionStepBase):
     screenshot_before: Optional[str]
     screenshot_after: Optional[str]
     retry_count: int
+    # Sprint 10.17: AI Screenshot Verification verdict (None when not a verify_screenshot step)
+    ai_verification_result: Optional[Dict[str, Any]] = None
     created_at: datetime
-    
+
+    @field_validator("ai_verification_result", mode="before")
+    @classmethod
+    def _parse_ai_verification_result(cls, v: Any) -> Optional[Dict[str, Any]]:
+        """Deserialize JSON text stored in the DB column to a dict."""
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        return None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -180,6 +198,19 @@ class HttpCredentials(BaseModel):
     username: str = Field(..., min_length=1, max_length=255, description="Basic auth username")
     password: str = Field(..., min_length=1, max_length=255, description="Basic auth password")
 
+
+class LoginCredentials(BaseModel):
+    """Ephemeral application-level CRM login credentials.
+
+    Sprint 10.14 — these are NEVER persisted to the database, logs, or stored
+    test steps.  They are resolved at run-time to auto-generated navigate/fill/click
+    steps and discarded immediately after execution starts.
+    """
+
+    username: str = Field(..., min_length=1, max_length=255, description="CRM login username")
+    password: str = Field(..., min_length=1, max_length=500, description="CRM login password — masked in all logs")
+
+
 class ExecutionStartRequest(BaseModel):
     """Schema for starting a test execution."""
     browser: str = Field(default="chromium", pattern="^(chromium|firefox|webkit)$", description="Browser to use")
@@ -197,6 +228,11 @@ class ExecutionStartRequest(BaseModel):
     http_credentials: Optional[HttpCredentials] = Field(
         None,
         description="HTTP Basic Auth credentials for the execution run (not stored)"
+    )
+    # Sprint 10.14: Ephemeral CRM login credentials (not persisted to DB)
+    login_credentials: Optional["LoginCredentials"] = Field(
+        None,
+        description="Ephemeral CRM application-level credentials — never written to DB or logs",
     )
     # Sprint 10.12 Feature B: Re-Run from Failed Step
     resume_from_execution_id: Optional[int] = Field(

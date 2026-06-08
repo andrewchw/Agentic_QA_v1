@@ -126,22 +126,12 @@ def get_executions(
     result: Optional[ExecutionResult] = None,
     browser: Optional[str] = None,
     environment: Optional[str] = None,
+    triggered_by: Optional[str] = None,
     skip: int = 0,
     limit: int = 100
 ) -> List[TestExecution]:
     """
     Get executions with optional filters.
-    
-    Args:
-        db: Database session
-        test_case_id: Filter by test case
-        user_id: Filter by user
-        status: Filter by status
-        result: Filter by result
-        browser: Filter by browser
-        environment: Filter by environment
-        skip: Number of records to skip
-        limit: Maximum records to return
     """
     query = db.query(TestExecution)
     
@@ -162,6 +152,9 @@ def get_executions(
     
     if environment:
         query = query.filter(TestExecution.environment == environment)
+
+    if triggered_by:
+        query = query.filter(TestExecution.triggered_by == triggered_by)
     
     return query.order_by(desc(TestExecution.created_at)).offset(skip).limit(limit).all()
 
@@ -173,7 +166,8 @@ def get_execution_count(
     status: Optional[ExecutionStatus] = None,
     result: Optional[ExecutionResult] = None,
     browser: Optional[str] = None,
-    environment: Optional[str] = None
+    environment: Optional[str] = None,
+    triggered_by: Optional[str] = None,
 ) -> int:
     """Get count of executions matching filters."""
     query = db.query(func.count(TestExecution.id))
@@ -195,6 +189,9 @@ def get_execution_count(
     
     if environment:
         query = query.filter(TestExecution.environment == environment)
+
+    if triggered_by:
+        query = query.filter(TestExecution.triggered_by == triggered_by)
     
     return query.scalar()
 
@@ -242,7 +239,8 @@ def create_execution_step(
     screenshot_path: Optional[str] = None,
     duration_seconds: Optional[float] = None,
     selector_used: Optional[str] = None,
-    action_method: Optional[str] = None
+    action_method: Optional[str] = None,
+    ai_verification_result: Optional[str] = None,
 ) -> TestExecutionStep:
     """Create an execution step."""
     db_step = TestExecutionStep(
@@ -258,7 +256,8 @@ def create_execution_step(
         completed_at=datetime.utcnow(),
         duration_seconds=duration_seconds,
         selector_used=selector_used,
-        action_method=action_method
+        action_method=action_method,
+        ai_verification_result=ai_verification_result,
     )
     db.add(db_step)
     db.commit()
