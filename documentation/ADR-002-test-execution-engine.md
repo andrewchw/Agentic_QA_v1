@@ -3663,4 +3663,3 @@ Enter contact number OTP for 85291234567
 **Production validation:**
 - Live API spike (10.21-B7): HTTP 200 from corp network; 8 OTP records parsed with alias-tolerant normaliser
 - Execution #950 / Test Case #1150: OTP step resolves after `PREPROD_OTP_SSL_VERIFY=false` fix
-
