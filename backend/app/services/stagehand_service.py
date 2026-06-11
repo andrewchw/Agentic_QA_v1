@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
@@ -19,14 +20,17 @@ from sqlalchemy.orm import Session
 from app.models.test_case import TestCase
 from app.models.test_execution import ExecutionStatus, ExecutionResult
 from app.crud import test_execution as crud_execution
-from app.services.email_otp_service import (
-    email_otp_service,
-    format_otp_steps,
-    get_email_credential_for_user,
-    is_otp_step,
-)
+from app.services.email_otp_service import is_otp_step
+from app.services.otp_source_router import fetch_otp_and_format_steps
 from app.services.encryption_service import EncryptionService
 from app.services.step_module_resolver import resolve_steps
+from app.core.config import settings
+from app.utils.llm_execution_context import llm_exec_ctx
+from app.utils.llm_response_logger import (
+    build_prompt_preview,
+    extract_thinking_from_response,
+    llm_logger,
+)
 
 encryption_service = EncryptionService() if os.getenv("CREDENTIAL_ENCRYPTION_KEY") else None
 
@@ -35,6 +39,38 @@ load_dotenv()
 
 # Logger for execution traces (captured by server file logging)
 logger = logging.getLogger(__name__)
+
+
+def _ensure_loopback_no_proxy() -> None:
+    """Bypass proxies for local browser/CDP traffic.
+
+    Some Windows devices inject HTTP_PROXY/HTTPS_PROXY into the backend
+    process. When Playwright resolves a local CDP endpoint through that proxy,
+    Chromium sees a non-loopback client and rejects /json/version with
+    "Request on loopback from external IP". Ensure loopback hosts are always
+    excluded before Stagehand calls connect_over_cdp().
+    """
+    required_hosts = ("127.0.0.1", "localhost", "::1")
+    existing_entries = []
+    seen = set()
+
+    for key in ("NO_PROXY", "no_proxy"):
+        raw_value = os.environ.get(key, "")
+        for entry in raw_value.split(","):
+            cleaned = entry.strip()
+            if cleaned and cleaned.lower() not in seen:
+                existing_entries.append(cleaned)
+                seen.add(cleaned.lower())
+
+    missing_entries = [host for host in required_hosts if host.lower() not in seen]
+    if not missing_entries:
+        return
+
+    merged_entries = existing_entries + missing_entries
+    merged_value = ",".join(merged_entries)
+    os.environ["NO_PROXY"] = merged_value
+    os.environ["no_proxy"] = merged_value
+    logger.info("StagehandExecutionService: Added loopback hosts to NO_PROXY for local CDP traffic")
 
 # Fix for Windows: Ensure ProactorEventLoop is used
 if sys.platform == 'win32':
@@ -71,6 +107,8 @@ class StagehandExecutionService:
         self.page = None
         # Set during execute_test / analysis realtime runs so _execute_navigation can embed HTTP Basic auth
         self._runtime_http_credentials: Optional[Dict[str, Any]] = None
+        self._stagehand_provider_name: Optional[str] = None
+        self._stagehand_model_name: Optional[str] = None
 
     def set_runtime_http_credentials(self, creds: Optional[Dict[str, Any]]) -> None:
         """HTTP Basic auth for navigations (e.g. UAT). Applied in _execute_navigation when URL is extracted."""
@@ -81,6 +119,128 @@ class StagehandExecutionService:
             }
         else:
             self._runtime_http_credentials = None
+
+    def _set_stagehand_llm_identity(self, provider: str, model_name: Optional[str]) -> None:
+        self._stagehand_provider_name = provider
+        self._stagehand_model_name = model_name
+
+    @staticmethod
+    def _normalise_stagehand_response(response: Any) -> Optional[Dict[str, Any]]:
+        if response is None:
+            return None
+        if isinstance(response, dict):
+            return response
+
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return model_dump(mode="json")
+            except TypeError:
+                return model_dump()
+
+        model_dump_json = getattr(response, "model_dump_json", None)
+        if callable(model_dump_json):
+            return json.loads(model_dump_json())
+
+        as_dict = getattr(response, "dict", None)
+        if callable(as_dict):
+            return as_dict()
+
+        return None
+
+    async def _write_stagehand_llm_log(
+        self,
+        *,
+        messages: list,
+        model: Optional[str],
+        response: Any,
+        error: Optional[str],
+        elapsed_ms: float,
+        function_name: Optional[str],
+    ) -> None:
+        try:
+            response_dict = self._normalise_stagehand_response(response)
+            ctx = llm_exec_ctx.get()
+            full_prompt = bool(getattr(settings, "LLM_LOG_FULL_PROMPT", False))
+
+            thinking_content = None
+            response_content = None
+            thinking_tokens = None
+            prompt_tokens = None
+            completion_tokens = None
+            total_tokens = None
+
+            if response_dict:
+                thinking_content, response_content, thinking_tokens = extract_thinking_from_response(
+                    response_dict
+                )
+                usage = response_dict.get("usage") or {}
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                total_tokens = usage.get("total_tokens")
+
+            caller_suffix = (function_name or "agent").lower()
+            entry = {
+                "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(datetime.utcnow().microsecond / 1000):03d}Z",
+                "execution_id": ctx.get("execution_id"),
+                "step_number": ctx.get("step_number"),
+                "tier": ctx.get("tier"),
+                "caller": f"stagehand_{caller_suffix}",
+                "provider": self._stagehand_provider_name,
+                "model": model or self._stagehand_model_name or "",
+                "prompt_chars": sum(len(str(message.get("content", ""))) for message in messages),
+                "prompt_preview": build_prompt_preview(messages, full_prompt=full_prompt),
+                "response_time_ms": round(elapsed_ms, 1),
+                "thinking_content": thinking_content,
+                "response_content": response_content,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "thinking_tokens": thinking_tokens,
+                "total_tokens": total_tokens,
+                "success": error is None,
+                "error": error,
+            }
+            await llm_logger.write(entry)
+        except Exception as exc:
+            logger.debug("Stagehand LLM logging failed (non-fatal): %s", exc)
+
+    def _instrument_stagehand_llm(self) -> None:
+        if not self.stagehand or not getattr(self.stagehand, "llm", None):
+            return
+
+        llm_client = self.stagehand.llm
+        if getattr(llm_client, "_awt_llm_logging_wrapped", False):
+            return
+
+        original_create_response = llm_client.create_response
+
+        async def wrapped_create_response(*, messages: list[dict[str, Any]], model: Optional[str] = None, function_name: Optional[str] = None, **kwargs: Any):
+            started = time.monotonic()
+            response = None
+            error = None
+            try:
+                response = await original_create_response(
+                    messages=messages,
+                    model=model,
+                    function_name=function_name,
+                    **kwargs,
+                )
+                return response
+            except Exception as exc:
+                error = str(exc)
+                raise
+            finally:
+                await self._write_stagehand_llm_log(
+                    messages=messages,
+                    model=model,
+                    response=response,
+                    error=error,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    function_name=function_name,
+                )
+
+        llm_client.create_response = wrapped_create_response
+        llm_client._awt_llm_logging_wrapped = True
 
     async def initialize(self, user_config: Optional[Dict[str, Any]] = None):
         """
@@ -132,6 +292,7 @@ class StagehandExecutionService:
                 elif use_google_direct:
                     model_provider = "google"
                 logger.info(f"StagehandExecutionService: Using .env default provider: {model_provider}")
+            selected_model_name: Optional[str] = None
             
             # Configure model based on provider
             if model_provider == "cerebras":
@@ -159,6 +320,7 @@ class StagehandExecutionService:
                     model_api_key=cerebras_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = cerebras_model
                 logger.info(f"StagehandExecutionService: Using Cerebras API with model: {cerebras_model}")
                 if user_config:
                     logger.debug(
@@ -192,6 +354,7 @@ class StagehandExecutionService:
                     model_api_key=google_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = google_model
                 logger.info(f"StagehandExecutionService: Using Google API directly with model: {google_model}")
                 if user_config:
                     logger.debug(
@@ -243,6 +406,7 @@ class StagehandExecutionService:
                     model_api_key=azure_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = azure_model
                 logger.info(
                     "StagehandExecutionService: Using Azure OpenAI with deployment: %s",
                     azure_model,
@@ -274,6 +438,7 @@ class StagehandExecutionService:
                     model_api_key=openrouter_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = openrouter_model
                 logger.info(f"StagehandExecutionService: Using OpenRouter with model: {openrouter_model}")
                 if user_config:
                     logger.debug(
@@ -286,7 +451,7 @@ class StagehandExecutionService:
                 # Sprint 10.13: On-premises vLLM servers — OpenAI-compatible endpoints.
                 # Each model has its own base URL; LiteLLM routes via openai/ prefix.
                 local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
-                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+                local_api_key = (user_config or {}).get("api_key") or os.getenv("LOCAL_VLLM_API_KEY", "local")
 
                 # Resolve per-model endpoint from env (can be overridden in .env)
                 _endpoint_map = {
@@ -304,6 +469,10 @@ class StagehandExecutionService:
                     ),
                 }
                 local_endpoint = _endpoint_map.get(local_model, os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"))
+                # Phase 2: custom endpoint from user config overrides hardcoded map
+                _custom_ep = (user_config or {}).get("local_vllm_custom_endpoint")
+                if _custom_ep:
+                    local_endpoint = _custom_ep
 
                 # LiteLLM requires OPENAI_API_BASE + openai/<model> for custom endpoints.
                 # Clear Azure env vars so LiteLLM does not mis-route.
@@ -319,8 +488,10 @@ class StagehandExecutionService:
                     verbose=1,
                     model_name=f"openai/{local_model}",
                     model_api_key=local_api_key,
+                    model_client_options={"api_base": local_endpoint},
                     local_browser_launch_options=launch_options,
                 )
+                selected_model_name = local_model
                 logger.info(
                     "StagehandExecutionService: Using local vLLM model=%s endpoint=%s",
                     local_model,
@@ -346,6 +517,7 @@ class StagehandExecutionService:
                     model_api_key=openrouter_key,
                     local_browser_launch_options=launch_options,
                 )
+                selected_model_name = openrouter_model
                 logger.info(f"StagehandExecutionService: Fallback to OpenRouter with model: {openrouter_model}")
 
             
@@ -355,8 +527,10 @@ class StagehandExecutionService:
                 browser_slowmo,
             )
             
+            self._set_stagehand_llm_identity(model_provider, selected_model_name)
             self.stagehand = Stagehand(config)
             await self.stagehand.init()
+            self._instrument_stagehand_llm()
             self.page = self.stagehand.page
             
             if not self.page:
@@ -381,12 +555,14 @@ class StagehandExecutionService:
                 "StagehandExecutionService: Connecting Stagehand to existing browser via CDP: %s",
                 cdp_endpoint,
             )
+            _ensure_loopback_no_proxy()
             
             # Configure model based on provider (same logic as initialize())
             if user_config:
                 model_provider = user_config.get("provider", "openrouter").lower()
             else:
                 model_provider = os.getenv("MODEL_PROVIDER", "openrouter").lower()
+            selected_model_name: Optional[str] = None
             
             # Build browser launch options with CDP URL
             # NOTE: Python Stagehand uses "cdp_url" (underscore), not "cdpUrl" (camelCase)
@@ -409,6 +585,7 @@ class StagehandExecutionService:
                     model_api_key=cerebras_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = cerebras_model
                 print(f"[DEBUG] ✅ CDP connection with Cerebras: {cerebras_model}")
                 
             elif model_provider == "google":
@@ -425,6 +602,7 @@ class StagehandExecutionService:
                     model_api_key=google_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = google_model
                 print(f"[DEBUG] ✅ CDP connection with Google: {google_model}")
 
             elif model_provider == "azure":
@@ -462,12 +640,13 @@ class StagehandExecutionService:
                     model_api_key=azure_api_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = azure_model
                 print(f"[DEBUG] ✅ CDP connection with Azure OpenAI deployment: {azure_model}")
 
             elif model_provider == "local_vllm":
                 # Sprint 10.13: On-premises vLLM — OpenAI-compatible endpoints via CDP
                 local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
-                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+                local_api_key = (user_config or {}).get("api_key") or os.getenv("LOCAL_VLLM_API_KEY", "local")
 
                 _endpoint_map = {
                     "openai/gpt-oss-20b": os.getenv(
@@ -487,6 +666,9 @@ class StagehandExecutionService:
                     local_model,
                     os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"),
                 )
+                _custom_ep = (user_config or {}).get("local_vllm_custom_endpoint")
+                if _custom_ep:
+                    local_endpoint = _custom_ep
 
                 os.environ["OPENAI_API_BASE"] = local_endpoint.rstrip("/")
                 os.environ["OPENAI_API_KEY"] = local_api_key
@@ -500,8 +682,10 @@ class StagehandExecutionService:
                     verbose=1,
                     model_name=f"openai/{local_model}",
                     model_api_key=local_api_key,
+                    model_client_options={"api_base": local_endpoint},
                     local_browser_launch_options=launch_options,
                 )
+                selected_model_name = local_model
                 print(f"[DEBUG] ✅ CDP connection with local vLLM model={local_model} endpoint={local_endpoint}")
 
             else:  # openrouter / fallback
@@ -518,10 +702,13 @@ class StagehandExecutionService:
                     model_api_key=openrouter_key,
                     local_browser_launch_options=launch_options
                 )
+                selected_model_name = openrouter_model
                 print(f"[DEBUG] ✅ CDP connection with OpenRouter: {openrouter_model}")
 
+            self._set_stagehand_llm_identity(model_provider, selected_model_name)
             self.stagehand = Stagehand(config)
             await self.stagehand.init()
+            self._instrument_stagehand_llm()
             self.page = self.stagehand.page
             
             if not self.page:
@@ -700,7 +887,7 @@ class StagehandExecutionService:
             elif model_provider == "local_vllm":
                 # Sprint 10.13: On-premises vLLM — debug persistent session
                 local_model = (user_config.get("model") if user_config else None) or "DeepSeek-V4-Flash-4bit"
-                local_api_key = os.getenv("LOCAL_VLLM_API_KEY", "local")
+                local_api_key = (user_config or {}).get("api_key") or os.getenv("LOCAL_VLLM_API_KEY", "local")
 
                 _endpoint_map = {
                     "openai/gpt-oss-20b": os.getenv(
@@ -720,6 +907,9 @@ class StagehandExecutionService:
                     local_model,
                     os.getenv("LOCAL_VLLM_DEEPSEEK_ENDPOINT", "http://192.168.206.164:1235/v1"),
                 )
+                _custom_ep = (user_config or {}).get("local_vllm_custom_endpoint")
+                if _custom_ep:
+                    local_endpoint = _custom_ep
 
                 os.environ["OPENAI_API_BASE"] = local_endpoint.rstrip("/")
                 os.environ["OPENAI_API_KEY"] = local_api_key
@@ -733,6 +923,7 @@ class StagehandExecutionService:
                     verbose=1,
                     model_name=f"openai/{local_model}",
                     model_api_key=local_api_key,
+                    model_client_options={"api_base": local_endpoint},
                     local_browser_launch_options=launch_options,
                 )
                 print(f"[DEBUG] ✅ Using local vLLM model={local_model} endpoint={local_endpoint} (Debug Mode)")
@@ -755,8 +946,10 @@ class StagehandExecutionService:
 
             print(f"[DEBUG] Persistent browser settings: headless=False (debug mode), devtools={devtools}")
             
+            self._set_stagehand_llm_identity(model_provider, locals().get("cerebras_model") or locals().get("google_model") or locals().get("azure_model") or locals().get("local_model") or locals().get("openrouter_model"))
             self.stagehand = Stagehand(config)
             await self.stagehand.init()
+            self._instrument_stagehand_llm()
             self.page = self.stagehand.page
             
             if not self.page:
@@ -1056,7 +1249,9 @@ class StagehandExecutionService:
                 # JIT OTP expansion: poll IMAP only when we reach the OTP placeholder
                 # step and only if this index is NOT inside a previously-expanded range.
                 if step_index >= otp_expanded_end and is_otp_step(step_desc):
-                    expanded = self._fetch_otp_and_format_steps(step_desc, db, user_id)
+                    expanded = self._fetch_otp_and_format_steps(
+                        step_desc, db, user_id, test_url=base_url
+                    )
                     steps[step_index:step_index + 1] = expanded
                     total_steps = len(steps)
                     otp_expanded_end = step_index + len(expanded)
@@ -1204,60 +1399,43 @@ class StagehandExecutionService:
         
         return execution
 
-    def _expand_otp_steps_list(self, steps: list, db, user_id: int) -> list:
+    def _expand_otp_steps_list(
+        self, steps: list, db, user_id: int, test_url: Optional[str] = None
+    ) -> list:
         """
         Pre-expand OTP steps into per-digit steps before the execution loop.
 
         For each step that matches an OTP pattern, replaces it with N individual
         steps (one per digit). Non-OTP steps are passed through unchanged. If
-        the IMAP poll fails or no credential is configured the original step is
-        kept unchanged so execution continues normally.
+        OTP fetch fails or no source is configured the original step is kept
+        unchanged so execution continues normally.
         """
         result = []
         for step in steps:
             step_str = str(step)
             if is_otp_step(step_str):
-                expanded = self._fetch_otp_and_format_steps(step_str, db, user_id)
+                expanded = self._fetch_otp_and_format_steps(
+                    step_str, db, user_id, test_url=test_url
+                )
                 result.extend(expanded)
             else:
                 result.append(step)
         return result
 
-    def _fetch_otp_and_format_steps(self, step_description: str, db, user_id: int) -> list:
+    def _fetch_otp_and_format_steps(
+        self,
+        step_description: str,
+        db,
+        user_id: int,
+        test_url: Optional[str] = None,
+    ) -> list:
         """
-        Fetch OTP via IMAP and return a list of one step per digit.
+        Resolve OTP source (preprod API or IMAP) and return per-digit step descriptions.
         Falls back to [step_description] unchanged on any error.
         """
-        if db is None or encryption_service is None:
-            logger.warning("OTP step detected but db/encryption not available; skipping IMAP poll")
-            return [step_description]
-
-        cred = get_email_credential_for_user(db, user_id)
-        if cred is None:
-            logger.warning(
-                "OTP step detected for user %s but no email credential configured", user_id
-            )
-            return [step_description]
-
-        try:
-            app_password = encryption_service.decrypt_password(cred.imap_password_encrypted)
-            from app.core.config import settings as app_settings
-            otp = email_otp_service.poll_otp(
-                imap_host=cred.imap_host,
-                imap_port=cred.imap_port,
-                email_address=cred.email_address,
-                app_password=app_password,
-                timeout=app_settings.EMAIL_OTP_POLL_TIMEOUT,
-                interval=app_settings.EMAIL_OTP_POLL_INTERVAL,
-            )
-            logger.info("OTP resolved for user %s: %s — expanding into %d steps", user_id, otp, len(otp))
-            return format_otp_steps(otp)
-        except TimeoutError as exc:
-            logger.warning("OTP poll timed out for user %s: %s", user_id, exc)
-            return [f"Enter OTP (No OTP email received — {exc})"]
-        except Exception as exc:
-            logger.error("OTP resolution error for user %s: %s", user_id, exc)
-            return [step_description]
+        return fetch_otp_and_format_steps(
+            step_description, db, user_id, test_url=test_url
+        )
 
     async def _execute_step_hybrid(self, step_description: str, step_number: int) -> Dict[str, Any]:
         """

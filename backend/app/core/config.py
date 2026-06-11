@@ -77,6 +77,18 @@ class Settings(BaseSettings):
     EMAIL_OTP_POLL_TIMEOUT: int = 60    # seconds to wait for OTP email
     EMAIL_OTP_POLL_INTERVAL: int = 3    # seconds between polls
 
+    # Sprint 10.21: Three HK preprod API OTP polling (non-browser)
+    THREE_PREPROD_OTP_API_URL: str = (
+        "https://moapp-api-uat4-backend.apps.ocpppd.three.com.hk/"
+        "moapp-api/HTHK/THREE/THREE/intl/getOtpInfoListFor1Hour"
+    )
+    PREPROD_OTP_POLL_TIMEOUT: int = 60   # seconds to wait for OTP via API
+    PREPROD_OTP_POLL_INTERVAL: int = 3   # seconds between API polls
+    PREPROD_OTP_UAT_ONLY: bool = True   # only use API OTP on *.three.com.hk URLs
+    # Internal OpenShift preprod uses corp CA — not in public trust store by default
+    PREPROD_OTP_SSL_VERIFY: bool = False
+    PREPROD_OTP_SSL_CA_BUNDLE: str | None = None  # optional PEM path; overrides verify when set
+
     # Sprint 10.13: Local vLLM / on-premises OpenAI-compatible models
     # Each model has its own endpoint; no auth key required by default (set to "local" or a real key)
     LOCAL_VLLM_GPT_OSS_20B_ENDPOINT: str = "http://192.168.206.190:8000/openai--gpt-oss-20b/v1"
@@ -103,6 +115,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str | None = None
     # DM chat ID between your Telegram user account and the qa-manager bot
     QA_MANAGER_TELEGRAM_CHAT_ID: str | None = None
+
+    # Sprint 10.19: LLM Response & Timing Log
+    LLM_LOG_DIR: str = "logs/llm"
+    LLM_LOG_MAX_FILES: int = 200
+    LLM_LOG_FULL_PROMPT: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

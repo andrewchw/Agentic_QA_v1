@@ -8,6 +8,7 @@ import json
 import os
 import re
 import logging
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
@@ -22,7 +23,6 @@ from app.models.test_execution import (
     ExecutionResult
 )
 from app.models.execution_settings import ExecutionSettings
-from app.models.user_settings import UserSetting
 from app.crud import test_execution as crud_execution
 from app.crud import execution_feedback as crud_feedback
 from app.schemas.execution_feedback import ExecutionFeedbackCreate
@@ -30,15 +30,11 @@ from app.services.three_tier_execution_service import ThreeTierExecutionService
 from app.services.post_click_readiness import auto_dismiss_blocking_modals
 from app.utils.http_auth_credentials import http_credentials_for_url
 from app.utils.test_data_generator import TestDataGenerator
-from app.services.email_otp_service import (
-    email_otp_service,
-    format_otp_steps,
-    get_email_credential_for_user,
-    is_otp_step,
-)
-from app.services.encryption_service import EncryptionService as _EncryptionService
+from app.services.email_otp_service import is_otp_step
+from app.services.otp_source_router import fetch_otp_and_format_steps
 from app.services.step_module_resolver import resolve_steps
 from app.services.root_cause_analysis_service import generate_root_cause_analysis
+from app.services.user_settings_service import user_settings_service
 from app.crud.step_session_snapshot import save_step_session_snapshot, get_step_session_snapshot
 
 logger = logging.getLogger(__name__)
@@ -50,6 +46,20 @@ STEALTH_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
+
+
+def _find_free_port() -> int:
+    """Return an available TCP port on 127.0.0.1.
+
+    Binding with port 0 lets the OS assign an ephemeral port, then we
+    immediately release it so Chromium can bind to the same address.  The
+    window between release and Chromium binding is negligibly small in
+    practice — far better than a fixed, well-known port (9222) that other
+    processes (VS Code debugger, Edge, a prior test run) may already hold.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 class ExecutionConfig:
@@ -95,6 +105,7 @@ class ExecutionService:
         self.three_tier_service: Optional[ThreeTierExecutionService] = None
         self.test_data_generator = TestDataGenerator()
         self._generated_data_cache: Dict[str, Dict[str, str]] = {}  # Cache per test_id
+        self._cdp_port: int = 9222  # Default; overwritten with a free port in initialize()
     
     def _get_user_execution_settings(self, db: Session, user_id: int) -> ExecutionSettings:
         """
@@ -126,7 +137,9 @@ class ExecutionService:
         
         return default_settings
 
-    def _expand_otp_steps_list(self, steps: list, db: Session, user_id: int) -> list:
+    def _expand_otp_steps_list(
+        self, steps: list, db: Session, user_id: int, test_url: Optional[str] = None
+    ) -> list:
         """
         Pre-expand any OTP step in *steps* into N individual per-digit steps.
         Returns a new list; non-OTP steps are passed through unchanged.
@@ -135,50 +148,28 @@ class ExecutionService:
         for step in steps:
             step_str = str(step)
             if is_otp_step(step_str):
-                expanded = self._fetch_otp_and_format_steps(step_str, db, user_id)
+                expanded = self._fetch_otp_and_format_steps(
+                    step_str, db, user_id, test_url=test_url
+                )
                 result.extend(expanded)
             else:
                 result.append(step)
         return result
 
-    def _fetch_otp_and_format_steps(self, step_description: str, db: Session, user_id: int) -> list:
+    def _fetch_otp_and_format_steps(
+        self,
+        step_description: str,
+        db: Session,
+        user_id: int,
+        test_url: Optional[str] = None,
+    ) -> list:
         """
-        Fetch OTP from IMAP and return a list of per-digit step descriptions.
+        Resolve OTP source (preprod API or IMAP) and return per-digit step descriptions.
         Falls back to a single error step if OTP cannot be retrieved.
         """
-        import os as _os
-        key = _os.getenv("CREDENTIAL_ENCRYPTION_KEY")
-        if not key:
-            logger.warning("OTP step detected but CREDENTIAL_ENCRYPTION_KEY not set; skipping IMAP poll")
-            return [step_description]
-
-        cred = get_email_credential_for_user(db, user_id)
-        if cred is None:
-            logger.warning(
-                "OTP step detected for user %s but no email credential configured", user_id
-            )
-            return [step_description]
-
-        try:
-            enc = _EncryptionService()
-            app_password = enc.decrypt_password(cred.imap_password_encrypted)
-            from app.core.config import settings as app_settings
-            otp = email_otp_service.poll_otp(
-                imap_host=cred.imap_host,
-                imap_port=cred.imap_port,
-                email_address=cred.email_address,
-                app_password=app_password,
-                timeout=app_settings.EMAIL_OTP_POLL_TIMEOUT,
-                interval=app_settings.EMAIL_OTP_POLL_INTERVAL,
-            )
-            logger.info("OTP resolved for user %s — expanding into %d steps", user_id, len(otp))
-            return format_otp_steps(otp)
-        except TimeoutError as exc:
-            logger.warning("OTP poll timed out for user %s: %s", user_id, exc)
-            return [f"Enter OTP (No OTP email received — {exc})"]
-        except Exception as exc:
-            logger.error("OTP resolution error for user %s: %s", user_id, exc)
-            return [step_description]
+        return fetch_otp_and_format_steps(
+            step_description, db, user_id, test_url=test_url
+        )
 
     async def initialize(self):
         """Initialize Playwright and browser."""
@@ -198,12 +189,27 @@ class ExecutionService:
                     slow_mo=self.config.slow_mo
                 )
             else:  # chromium (default)
-                # Launch with remote debugging port for CDP access
+                # Allocate a free port for CDP to avoid conflicts with other
+                # processes (Edge, VS Code debugger, prior test runs) that may
+                # already hold port 9222.  If the port is pre-empted after
+                # allocation but before Chrome binds it, Chrome silently
+                # discards --remote-debugging-port and Stagehand would connect
+                # to the wrong endpoint.  Using a dynamic port makes the race
+                # window negligibly small compared to a fixed, well-known port.
+                self._cdp_port = _find_free_port()
+                logger.info("[CDP] Allocated debugging port %d", self._cdp_port)
                 self.browser = await self.playwright.chromium.launch(
                     headless=self.config.headless,
                     slow_mo=self.config.slow_mo,
                     args=[
-                        '--remote-debugging-port=9222',  # Fixed port for CDP
+                        f'--remote-debugging-port={self._cdp_port}',
+                        # Chrome 128+ validates the Origin header on the DevTools
+                        # HTTP endpoint (/json/version/).  Playwright's internal
+                        # driver does not send a trusted Origin, so Chrome returns
+                        # 400 on newer Chromium builds (Playwright ≥1.49 / Chrome
+                        # ≥128).  This flag disables that check so that
+                        # connect_over_cdp() can retrieve the WebSocket URL.
+                        '--remote-allow-origins=*',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-dev-shm-usage',
                         '--no-first-run',
@@ -674,31 +680,21 @@ class ExecutionService:
             if browser_profile_data:
                 await self._apply_profile_cookies(page, browser_profile_data)
             
-            # Get CDP endpoint for shared browser context.
-            # Use explicit IPv4 address (127.0.0.1) instead of "localhost".
-            # On Windows, "localhost" can resolve to IPv6 [::1] while Playwright's
-            # Chromium only binds --remote-debugging-port on IPv4 127.0.0.1,
-            # causing HTTP 400 and Stagehand falling back to launching a second browser.
-            cdp_endpoint = "http://127.0.0.1:9222"
+            # Build the CDP endpoint from the port that was dynamically allocated
+            # in initialize().  Using a free port prevents HTTP 400 errors that
+            # occur when port 9222 is already held by another process (Edge,
+            # VS Code debug adapter, a previous test run that did not clean up).
+            # Always use 127.0.0.1 (not localhost) so the address resolves to
+            # IPv4 on Windows regardless of the system's DNS/hosts configuration.
+            cdp_endpoint = f"http://127.0.0.1:{self._cdp_port}"
             
             logger.info(f"[DEBUG] CDP endpoint: {cdp_endpoint}")
             
             # Get user's execution settings and initialize 3-Tier service
             user_settings = self._get_user_execution_settings(db, user_id)
             
-            # Get user's AI provider config from UserSetting table
-            user_ai_config = None
-            user_setting = db.query(UserSetting).filter(UserSetting.user_id == user_id).first()
-            if user_setting:
-                user_ai_config = {
-                    "provider": user_setting.execution_provider,
-                    "model": user_setting.execution_model,
-                    "temperature": user_setting.execution_temperature,
-                    "max_tokens": user_setting.execution_max_tokens
-                }
-                logger.info(f"[DEBUG] 🎯 User AI config from DB: {user_ai_config}")
-            else:
-                logger.info("[DEBUG] ⚠️ No user settings found, will use .env defaults")
+            user_ai_config = user_settings_service.get_provider_config(db, user_id, "execution")
+            logger.info(f"[DEBUG] 🎯 User AI config from resolver: {user_ai_config}")
             
             self.three_tier_service = ThreeTierExecutionService(
                 db=db,
@@ -824,7 +820,9 @@ class ExecutionService:
                 # step and only if this index is NOT inside a previously-expanded range.
                 # CRM step dicts are never OTP steps — guard with isinstance check.
                 if idx > otp_expanded_end and isinstance(step_desc, str) and is_otp_step(step_desc):
-                    expanded = self._fetch_otp_and_format_steps(step_desc, db, user_id)
+                    expanded = self._fetch_otp_and_format_steps(
+                        step_desc, db, user_id, test_url=base_url
+                    )
                     steps[idx - 1:idx] = expanded
                     total_steps = len(steps)
                     otp_expanded_end = idx + len(expanded) - 1
@@ -2142,6 +2140,11 @@ class ExecutionService:
                     error_type=error_type,
                     provider=rca_provider,
                     model=rca_model,
+                    # Phase 2: forward custom vLLM endpoint
+                    custom_endpoint=self.three_tier_service.user_ai_config.get("local_vllm_custom_endpoint") if self.three_tier_service and self.three_tier_service.user_ai_config else None,
+                    api_key=self.three_tier_service.user_ai_config.get("api_key") if self.three_tier_service and self.three_tier_service.user_ai_config else None,
+                    azure_endpoint=self.three_tier_service.user_ai_config.get("azure_endpoint") if self.three_tier_service and self.three_tier_service.user_ai_config else None,
+                    azure_api_version=self.three_tier_service.user_ai_config.get("azure_api_version") if self.three_tier_service and self.three_tier_service.user_ai_config else None,
                 )
             
             # Create feedback entry

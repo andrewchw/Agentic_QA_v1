@@ -33,6 +33,10 @@
 - `backend/tests/test_xpath_cache_service.py`
 - `backend/tests/test_file_upload.py`
 - `backend/app/services/email_otp_service.py`
+- `backend/app/services/preprod_otp_service.py`
+- `backend/app/services/otp_source_router.py`
+- `backend/tests/unit/test_preprod_otp_service.py`
+- `backend/tests/integration/test_preprod_otp_execution.py`
 - `backend/app/models/email_credential.py`
 - `backend/app/schemas/email_credential.py`
 - `backend/app/api/v1/endpoints/email_credentials.py`
@@ -112,6 +116,8 @@
 43. [ADR-002-43: AI-Powered Failure Root Cause Analysis](#adr-002-43-ai-powered-failure-root-cause-analysis)
 44. [ADR-002-44: Re-Run from Failed Step — Session Snapshot Persistence and Resume Architecture](#adr-002-44-re-run-from-failed-step--session-snapshot-persistence-and-resume-architecture)
 45. [ADR-002-45: XPath Cache Management UI and Step-Level Invalidation](#adr-002-45-xpath-cache-management-ui-and-step-level-invalidation)
+46. [ADR-002-46: Stagehand Internal LLM Client Wrapper for Sprint 10.19 JSONL Logging](#adr-002-46-stagehand-internal-llm-client-wrapper-for-sprint-1019-jsonl-logging)
+47. [ADR-002-47: Three HK Preprod API OTP via HTTP (Non-Browser)](#adr-002-47-three-hk-preprod-api-otp-via-http-non-browser)
 
 ---
 
@@ -3507,4 +3513,154 @@ The design assumes that most cache entries are useful and should survive localiz
 - `backend/tests/unit/test_xpath_cache_api.py` (new) — 16 backend tests covering stats response, list response, keyword filter, single-row delete, bulk delete, invalid-only delete, and ORM schema compatibility
 - `frontend/src/components/__tests__/XPathCachePanel.test.tsx` (new) — 17 frontend tests covering loading, stats row, keyword filter, per-row delete, clear-invalid, clear-all, empty state, and error state
 - Manual verification via the Settings page and Execution Progress page confirmed that targeted cache deletion leaves unrelated valid rows intact and that zero-match step clears surface a non-error message instead of failing
+
+---
+
+## ADR-002-46: Stagehand Internal LLM Client Wrapper for Sprint 10.19 JSONL Logging
+
+### Context
+
+Sprint 10.19 introduced per-execution JSONL log files covering every LLM call made during a 3-tier test execution. The original design assumed all LLM traffic flows through `UniversalLLMService.chat_completion()` or `vision_completion()`, both of which were instrumented to write log entries via `LLMResponseLogger`.
+
+Production validation on executions #933–#935 revealed a blind spot: **Tier 2 (`Tier2HybridExecutor`) succeeds primarily through Stagehand `page.observe()`**, which dispatches to an LLM via Stagehand’s own internal `LLMClient.create_response()` (backed by LiteLLM). This path never enters `UniversalLLMService`, so every successful Tier 2 XPath-extraction call was invisible to the Sprint 10.19 logger. Execution #935 used Tier 2 for all 7 steps and produced no `exec_935.jsonl` file at all, despite making 7 LLM calls.
+
+### Decision
+
+Instrument Stagehand’s internal LLM client by monkey-patching `stagehand.llm.create_response` immediately after each `stagehand.init()` call in `StagehandExecutionService`. Three new methods are added:
+
+**`_set_stagehand_llm_identity(provider: str, model_name: str)`**
+Stores the resolved provider and model name on the service instance after `StagehandConfig` is built but before `Stagehand()` is constructed. Called in every `initialize*` method alongside the config’s `model_provider` and `selected_model_name`.
+
+**`_instrument_stagehand_llm()`**
+Called after every `await self.stagehand.init()` (three call sites: `initialize()`, `initialize_with_cdp()`, `initialize_persistent()`). If `stagehand.llm` exists and has not been wrapped yet (guarded by `_awt_llm_logging_wrapped` sentinel attribute), replaces `llm.create_response` with an async wrapper that:
+1. Records `time.monotonic()` before the original call.
+2. Captures `response` on success or `error` string on exception.
+3. Always calls `await self._write_stagehand_llm_log(...)` in a `finally` block.
+4. Re-raises the original exception unchanged.
+
+**`_write_stagehand_llm_log(...)`**
+Builds and writes the JSONL entry. Reads the current `llm_exec_ctx` ContextVar to obtain `execution_id`, `step_number`, `tier`, and `caller`. Calls `_normalise_stagehand_response()` to convert the LiteLLM response object (which may be a Pydantic model or a plain dict) to a standard dict for field extraction. Sets `caller` to `"stagehand_{function_name}"` (e.g., `"stagehand_observe"`, `"stagehand_act"`). Swallows all logging exceptions so the wrapper never kills execution.
+
+**`_normalise_stagehand_response(response)`**
+Converts LiteLLM’s response object to `dict`. Tries `model_dump(mode="json")`, then `model_dump()`, then `model_dump_json()`, then `.dict()`, then falls back to `None`. This is needed because `litellm.acompletion` can return either a Pydantic `ModelResponse` or a plain dict depending on the LiteLLM version.
+
+**ContextVar update in `execute_step()`:**
+Before dispatching to Option A / B / C, `set_llm_context()` is called with the correct `tier` and `caller` for that option. Because the ContextVar is set before Stagehand `observe()` is invoked (Stagehand is called from within the option’s async call chain), the Stagehand wrapper reads the right `execution_id` and `tier` when it writes the JSONL entry.
+
+### Consequences
+
+**Positive**
+- All Stagehand `observe()` and `act()` LLM calls are now logged to `exec_{id}.jsonl` alongside `chat_completion()` and `vision_completion()` calls, completing the per-execution audit trail.
+- `caller: "stagehand_observe"` vs `caller: "stagehand_act"` distinguishes Tier 2 XPath extraction from Tier 3 full-AI execution in the log.
+- No change to Stagehand’s public API or `StagehandConfig`; wrapping happens post-init.
+- Idempotent guard prevents double-wrapping if `_instrument_stagehand_llm()` is accidentally called twice.
+- Stagehand LiteLLM response objects (Pydantic `ModelResponse`) are normalised to dict before field extraction, making the code version-independent.
+- Logging failures are fully swallowed: a broken logger never surfaces as a test failure.
+
+**Negative**
+- Monkey-patching an internal method (`llm.create_response`) creates a dependency on Stagehand’s private API. A Stagehand version upgrade that renames or removes `llm.create_response` will silently disable logging without raising an error (the wrapper simply won’t be applied).
+- `_instrument_stagehand_llm()` must be called at three separate `stagehand.init()` call sites (`initialize`, `initialize_with_cdp`, `initialize_persistent`). Adding a fourth initializer without calling `_instrument_stagehand_llm()` would reintroduce the blind spot.
+- `_normalise_stagehand_response()` applies a best-effort conversion; if none of the four strategies succeed, the response fields (`thinking_content`, `token_counts`) are `null` in the log entry. The entry still records `response_time_ms` and `success`.
+
+**Alternatives Considered**
+- **Use Stagehand’s `metrics_callback`**: The callback `_handle_llm_metrics` receives a LiteLLM response object and inference time, but its signature only accepts `(response, inference_time_ms, function_name)` and it is already wired to Stagehand’s own internal metrics tracking. Re-using it for JSONL logging would require calling an async logger from a synchronous callback (Stagehand’s `LLMClient` calls `metrics_callback` synchronously), which would require `asyncio.create_task` with no error surface. The wrapper approach is cleaner.
+- **Use Stagehand’s `external_logger` (log event stream)**: The logger callback receives structured log dicts but not raw LiteLLM response objects. Token counts and response content would need to be parsed from human-readable log strings, which is fragile.
+- **Subclass `LLMClient` and inject it**: Requires either modifying `StagehandConfig` to accept a custom LLM client class or post-init swapping of `stagehand.llm`. The post-init swap is functionally identical to the current monkey-patch and adds a class hierarchy for no benefit.
+- **Emit Stagehand token counts via the Stagehand `update_metrics()` pathway**: Only cumulative per-session totals are available; per-call timing and response content are not.
+
+### Tests
+
+- `backend/tests/unit/test_llm_response_logger.py` — 15 tests pass, including ContextVar helper tests (`test_set_llm_context_sets_contextvar`, `test_llm_exec_ctx_defaults_when_not_set`, `test_set_llm_context_reset_token`) that validate the mechanism the Stagehand wrapper depends on
+- End-to-end validated synthetically: a `FakeStagehand` with a `FakeLLM.create_response()` is wrapped via `_instrument_stagehand_llm()` with `execution_id=935` set in ContextVar; the resulting `exec_935.jsonl` entry confirms `execution_id=935`, `tier=2`, `caller="stagehand_observe"`, `provider="azure"`, `model="ChatGPT-UAT"`, `total_tokens=18`, `success=true`
+
+---
+
+## ADR-002-47: Three HK Preprod API OTP via HTTP (Non-Browser)
+
+**Date:** June 10, 2026  
+**Status:** ✅ Implemented and production-validated (Test Case #1150 / Execution #950)
+
+### Context
+
+Sprint 10.10 added IMAP email OTP retrieval for tests that receive OTP via email. Three HK UAT/preprod flows deliver OTP via SMS/app; QA exposes a diagnostic HTTP API (`getOtpInfoListFor1Hour`) that returns OTP records from the last hour. A headless or second browser to read OTP from a portal was explicitly rejected — it competes with the test browser, adds 30–60 s navigation overhead, and is unnecessary when a direct API exists.
+
+`HEADLESS_BROWSER` only controls test browser visibility; OTP retrieval must run entirely in the Python backend.
+
+**Production incident (Execution #950):** Initial deployment used default `httpx` TLS verification (`verify=True`). The OpenShift endpoint `*.apps.ocpppd.three.com.hk` presents a corporate CA certificate not in the public trust store on developer Windows machines, causing `[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate` on every poll attempt. OTP step never resolved until `resolve_ssl_verify()` was added.
+
+### Decision
+
+Add **`PreprodOtpService`** (`backend/app/services/preprod_otp_service.py`) — sync `httpx` GET polling with:
+- Tolerant JSON parsing (field aliases: `otp`/`otpCode`/`verificationCode`, `msisdn`/`contactNumber`, `otpType`/`type`, `createdAt`/`createTime`)
+- MSISDN + `otp_type` filtering
+- JIT `poll_start_time` with 5 s grace window and newest-first selection (mirrors Sprint 10.10 stale-OTP prevention)
+- MSISDN masking in logs
+- **`resolve_ssl_verify()`** — returns `PREPROD_OTP_SSL_CA_BUNDLE` path when set, else `PREPROD_OTP_SSL_VERIFY` (default `false` for internal preprod)
+
+Add **`OtpSourceRouter`** (`backend/app/services/otp_source_router.py`) — shared `fetch_otp_and_format_steps()` used by both `ExecutionService` and `StagehandExecutionService`:
+
+| Priority | Source | When |
+|---|---|---|
+| 1 | `three_preprod_api` | Step metadata `otp_source` or parsed MSISDN from step text |
+| 2 | `three_preprod_api` | Test URL `*.three.com.hk` + API URL configured + `PREPROD_OTP_UAT_ONLY` |
+| 3 | `imap_email` | User has email credential (Sprint 10.10 path unchanged) |
+| 4 | none | Graceful fallback — original step kept, warning logged |
+
+Both execution engines delegate `_fetch_otp_and_format_steps()` to the router and pass `test_url=base_url` during JIT expansion inside the step loop (ADR-002-40 pattern unchanged).
+
+Per-digit expansion reuses existing `format_otp_steps()` and `otp_expanded_end` JIT guard from ADR-002-39/40.
+
+**Supported step text:**
+```
+Enter login OTP for 85291234567
+Enter contact number OTP for 85291234567
+@otp:api(msisdn=85291234567,type=login)
+```
+
+**Environment variables** (`backend/app/core/config.py`, `backend/env.example`):
+- `THREE_PREPROD_OTP_API_URL`
+- `PREPROD_OTP_POLL_TIMEOUT` (default 60)
+- `PREPROD_OTP_POLL_INTERVAL` (default 3)
+- `PREPROD_OTP_UAT_ONLY` (default true)
+- `PREPROD_OTP_SSL_VERIFY` (default false — internal OpenShift corp CA)
+- `PREPROD_OTP_SSL_CA_BUNDLE` (optional PEM path; overrides verify when set)
+
+**Deferred:** `PreprodOtpSection.tsx` Settings UI — env-only configuration sufficient for v1.
+
+### Consequences
+
+**Positive**
+- Zero impact on Playwright/Stagehand browser session during OTP fetch
+- Works identically in headed and headless test runs
+- IMAP email OTP flows unchanged when preprod API does not match
+- Login vs contact-number OTP distinguishable via step text or `otp_type`
+- Corp CA TLS issue resolved without requiring OS-level cert installation on every dev machine
+
+**Negative**
+- API requires corp/VPN network; 503 outside network — graceful timeout step returned
+- `PREPROD_OTP_SSL_VERIFY=false` trades strict TLS for preprod convenience; teams with corp CA PEM should use `PREPROD_OTP_SSL_CA_BUNDLE` instead
+
+**Alternatives Considered**
+- **Headless browser to read OTP from portal:** Rejected — competes with test browser, slow, unnecessary when API exists
+- **Same browser tab navigates to OTP portal:** Rejected — destroys page state mid-flow
+- **Install corp root CA on every dev machine:** Rejected — high friction; optional via `PREPROD_OTP_SSL_CA_BUNDLE` for teams that prefer strict verify
+- **Global `httpx` verify=False:** Rejected — scoped to preprod OTP client only
+
+**Related files:**
+- `backend/app/services/preprod_otp_service.py`
+- `backend/app/services/otp_source_router.py`
+- `backend/app/services/execution_service.py`
+- `backend/app/services/stagehand_service.py`
+- `backend/app/core/config.py`
+- `backend/env.example`
+
+**Tests:**
+- `backend/tests/unit/test_preprod_otp_service.py` — 11 tests (parsing, selection, poll loop, SSL verify)
+- `backend/tests/integration/test_preprod_otp_execution.py` — 13 tests (router dispatch, JIT guard, API-vs-IMAP)
+- `backend/tests/integration/test_email_otp_execution.py` — 25 tests (IMAP regression after router refactor)
+- **Total OTP test suite: 79 pass**
+
+**Production validation:**
+- Live API spike (10.21-B7): HTTP 200 from corp network; 8 OTP records parsed with alias-tolerant normaliser
+- Execution #950 / Test Case #1150: OTP step resolves after `PREPROD_OTP_SSL_VERIFY=false` fix
 
